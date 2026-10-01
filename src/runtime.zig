@@ -778,14 +778,7 @@ pub const Executor = struct {
         self.tick_started_at = Timestamp.now(.monotonic);
 
         while (true) {
-            // Process ready coroutines
-            while (self.getNextTask()) |next_task| {
-                updateParentContext(next_task, &self.main_task.coro.context);
-                self.current_task = next_task;
-                next_task.coro.step();
-                self.current_task = null;
-                self.processCleanup();
-            }
+            self.drainReady();
 
             // Quanta spent this cycle mean tasks ran here: a busy executor
             // can't watch for stuck tasks, so it gives up the rescue baton.
@@ -838,6 +831,76 @@ pub const Executor = struct {
             if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
                 return;
             }
+        }
+    }
+
+    /// One pass of the run loop for a host that owns the thread and drives the
+    /// executor from its own event loop. The ready tasks run, the loop polls
+    /// for at most `wait_cap`, and the tasks that completions readied run.
+    /// Then control returns to the caller, which is the main task. Nothing
+    /// parks and nothing steals, so a caller that passes `.zero` never
+    /// blocks.
+    ///
+    /// Returns true when work remains for the next pass. That is ready tasks
+    /// that outran the tick budget, or completions the poll left queued. A
+    /// group member that finishes cancels its siblings, and those finish on
+    /// the next poll. The host then calls again before it waits on anything
+    /// else.
+    ///
+    /// Binds the executor to the calling thread on every call. A host may
+    /// run its loop on a different OS thread from one call to the next, as
+    /// a Dart isolate does, and nothing else ever moves an executor.
+    ///
+    /// Two things tell the host when to call again without spinning.
+    /// `loop.hostHandle` is a descriptor that becomes readable when the
+    /// loop has events. `loop.nextTimerDeadline` is the longest the host
+    /// may wait on that descriptor before a timer is due.
+    pub fn tick(self: *Executor, wait_cap: Duration) !bool {
+        setCurrentExecutor(self);
+        self.loop.adoptThread();
+
+        // Scheduler code, not a task. See `run`.
+        self.current_task = null;
+        defer self.current_task = &self.main_task;
+
+        self.processCleanup();
+
+        // A fresh tick budget per pass. The host decides the cadence, so
+        // the per-quantum estimate `run` keeps across its batches has
+        // nothing to retune against here.
+        self.tick_started_at = Timestamp.now(.monotonic);
+        self.tick_task_count = 0;
+        self.tick_expired = false;
+        self.tick_checkpoint_countdown = checkpoint_interval;
+
+        // Take the wakes handed out since the last pass before the ready
+        // tasks run, so what those tasks park lands in this pass's poll.
+        _ = self.checkLocalWork(false);
+        self.drainReady();
+        try self.loop.poll(wait_cap);
+        // A task that runs here can finish a completion the loop hands out
+        // inline, which wakes another task. Take those wakes in this pass
+        // too, a few times over, and leave the rest for the next one.
+        var pass: usize = 0;
+        while (pass < 4) : (pass += 1) {
+            self.drainDispatched();
+            self.drainReady();
+            if (!self.loop.hasDispatched()) break;
+        }
+        return !self.run_queue.isEmpty() or
+            !self.run_queue.overflow.isEmpty() or
+            self.loop.hasPendingWork();
+    }
+
+    /// Runs the ready tasks until the ring is empty or the tick budget is
+    /// spent.
+    fn drainReady(self: *Executor) void {
+        while (self.getNextTask()) |next_task| {
+            updateParentContext(next_task, &self.main_task.coro.context);
+            self.current_task = next_task;
+            next_task.coro.step();
+            self.current_task = null;
+            self.processCleanup();
         }
     }
 
@@ -2334,6 +2397,85 @@ test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker"
 
     handle.cancel(); // requests cancellation and waits for completion
     try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
+test "Executor.tick: a host drives a sleeping task to completion" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(done: *bool) !void {
+            try sleep(.fromMilliseconds(20));
+            done.* = true;
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{&done});
+    defer handle.cancel();
+
+    // Each tick waits at most 1ms, so the 20ms sleep takes several.
+    var ticks: usize = 0;
+    const start = Timestamp.now(.monotonic);
+    while (!done) : (ticks += 1) {
+        _ = try runtime.main_executor.tick(.fromMilliseconds(1));
+        try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 2000);
+    }
+    try std.testing.expect(ticks >= 2);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() >= 20);
+}
+
+test "Executor.tick: a zero wait returns at once with nothing ready" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const start = Timestamp.now(.monotonic);
+    const more = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!more);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 100);
+}
+
+test "Executor.tick: ready tasks run before the poll and after it" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(counter: *u32) void {
+            counter.* += 1;
+        }
+    };
+    var counter: u32 = 0;
+    var a = try runtime.spawn(Task.run, .{&counter});
+    defer a.cancel();
+    var b = try runtime.spawn(Task.run, .{&counter});
+    defer b.cancel();
+
+    _ = try runtime.main_executor.tick(.zero);
+
+    try std.testing.expectEqual(2, counter);
+}
+
+test "Loop: the host handle and the next timer deadline" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+
+    // The runtime may keep timers of its own, so the test claims only
+    // this. Once the sleep is armed, the next deadline is at most its 30ms.
+    const Task = struct {
+        fn run() !void {
+            try sleep(.fromMilliseconds(30));
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const deadline = loop.nextTimerDeadline().?;
+    try std.testing.expect(deadline.toMilliseconds() <= 30);
+    // A Windows handle is a SOCKET, and no Windows backend has one.
+    if (builtin.os.tag != .windows) {
+        if (loop.hostHandle()) |fd| try std.testing.expect(fd >= 0);
+    }
 }
 
 test "Runtime: implicit run" {

@@ -570,6 +570,33 @@ pub const Loop = struct {
         _ = self.loop_group.loops.fetchSub(1, .monotonic);
     }
 
+    /// Whether a poll left work behind that only another poll finishes:
+    /// completions queued during a drain, work completions from the thread
+    /// pool, cancellations posted from another thread, wakes handed out
+    /// and not yet taken, or registrations a backend applies on its next
+    /// poll. `Executor.tick` reports it to the host, which then calls again
+    /// before it waits.
+    pub fn hasPendingWork(self: *const Loop) bool {
+        return !self.state.completions.empty() or
+            !self.state.work_completions.empty() or
+            !self.state.dispatched.empty() or
+            self.cancel_queue.load(.acquire) != null or
+            self.backend.hasPendingChanges();
+    }
+
+    /// Whether the loop holds task wakes it handed out instead of calling,
+    /// which the executor takes with `nextDispatched`.
+    pub fn hasDispatched(self: *const Loop) bool {
+        return !self.state.dispatched.empty();
+    }
+
+    /// Makes the calling thread the loop's owner for the debug-only
+    /// ownership checks. For a loop a host drives with `Executor.tick`,
+    /// whose thread may change between calls.
+    pub fn adoptThread(self: *Loop) void {
+        if (in_debug_mode) current_loop = self;
+    }
+
     /// Debug-only: assert we're on the thread that owns this loop.
     inline fn assertOwnThread(self: *const Loop) void {
         if (in_debug_mode) std.debug.assert(current_loop == self);
@@ -623,6 +650,35 @@ pub const Loop = struct {
     /// only when the loop is sleeping in its poll and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
         if (self.state.requestWake(LoopState.wake_loop)) self.backend.wake(&self.state);
+    }
+
+    /// A descriptor a host thread can wait on to learn that the loop has
+    /// events to process, for a host that drives an executor with
+    /// `Executor.tick` from its own event loop. Null on a backend with no
+    /// such descriptor. When it is readable the host calls `tick`. The host
+    /// must not read from it.
+    pub fn hostHandle(self: *const Loop) ?net.fd_t {
+        return self.backend.hostHandle();
+    }
+
+    /// How long a host may wait on `hostHandle` before a timer is due, or
+    /// null when no timer is pending. A timer on a clock the backend arms
+    /// natively wakes the handle by itself. Only a poll fires the others,
+    /// so the host waits at most this long. Thread-safe.
+    pub fn nextTimerDeadline(self: *Loop) ?Duration {
+        self.state.lockTimers();
+        defer self.state.unlockTimers();
+        var next: ?Duration = null;
+        for (0..wall_clock_count) |idx| {
+            const timer = self.state.timers[idx].peek() orelse continue;
+            const current = time.now(indexClock(idx));
+            const remaining = if (timer.deadline.value > current.value)
+                current.durationTo(timer.deadline)
+            else
+                Duration.zero;
+            if (next == null or remaining.value < next.?.value) next = remaining;
+        }
+        return next;
     }
 
     /// Wake up the loop to process async handles (thread-safe)
@@ -1438,8 +1494,10 @@ pub const Loop = struct {
         }
 
         // Skip the backend poll when not waiting and there's nothing to retrieve.
-        // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.backend.hasInflight();
+        // This avoids syscall overhead for pure CPU-bound workloads. A
+        // registration the backend has queued still goes through. A host that
+        // parks on `hostHandle` needs it in the kernel first.
+        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges();
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.

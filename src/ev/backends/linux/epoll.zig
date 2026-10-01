@@ -290,6 +290,11 @@ pub fn deinit(self: *Self) void {
     self.shared.sock_table.release();
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    return self.epoll_fd;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     posix.eventfd_write(self.waker_eventfd, 1) catch {};
@@ -578,6 +583,13 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.shared.inflight_io.load(.monotonic) > 0;
+}
+
+/// Always false. epoll applies a registration when it is made. See
+/// `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    _ = self;
+    return false;
 }
 
 /// Submit a completion to the backend - infallible.

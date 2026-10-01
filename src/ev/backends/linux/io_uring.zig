@@ -440,6 +440,11 @@ pub fn deinit(self: *Self) void {
     }
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    return self.ring.fd;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     posix.eventfd_write(self.waker_eventfd, 1) catch {};
@@ -477,6 +482,13 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.inflight > 0;
+}
+
+/// Whether submission entries are queued for the next poll to submit. See
+/// `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    // `IoUring.sq_ready` computes the same, but takes a mutable ring.
+    return self.ring.sq.sqe_tail -% @atomicLoad(u32, self.ring.sq.head, .acquire) > 0;
 }
 
 /// Submit a completion to the backend - infallible.

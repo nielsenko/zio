@@ -528,6 +528,12 @@ fn wallTimerAPC(arg: ?*anyopaque, low: windows.DWORD, high: windows.DWORD) callc
     }
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    _ = self;
+    return null;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     // Queue an APC to wake the thread. Hot cross-thread path (every cross-thread
@@ -551,6 +557,13 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.shared_state.inflight_io.load(.monotonic) > 0;
+}
+
+/// Always false. No registration here waits for a poll. See
+/// `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    _ = self;
+    return false;
 }
 
 /// Submit a completion to the backend - infallible.
