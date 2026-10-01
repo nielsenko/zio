@@ -2454,6 +2454,35 @@ test "Executor.tick: ready tasks run before the poll and after it" {
     try std.testing.expectEqual(2, counter);
 }
 
+test "Executor.tick: a timed send that completes at submit finishes in one tick" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const fds = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(fds[0]);
+    defer os_net.close(fds[1]);
+
+    const Task = struct {
+        fn run(fd: os_net.fd_t, done: *bool) !void {
+            var iov: [1]os.iovec_const = undefined;
+            _ = try net.writeBuf(fd, .fromSlice("x", &iov), .fromMilliseconds(1000));
+            done.* = true;
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ fds[0], &done });
+    defer handle.cancel();
+
+    // The kernel accepts the send at submit, or at this tick's poll on a
+    // ring backend. The timer it raced never holds the task to a second
+    // tick.
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(done);
+}
+
 test "Loop: the host handle and the next timer deadline" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
