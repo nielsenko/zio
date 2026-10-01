@@ -294,6 +294,11 @@ pub fn deinit(self: *Self) void {
     self.shared.sock_table.release();
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    return self.kqueue_fd;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     var changes: [1]std.c.Kevent = .{.{
@@ -595,6 +600,12 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.shared.inflight_io.load(.monotonic) > 0;
+}
+
+/// Whether registrations are queued for the next poll to apply. See
+/// `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    return self.change_buffer.items.len > 0;
 }
 
 /// Submit a completion to the backend - infallible.

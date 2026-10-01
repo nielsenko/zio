@@ -248,6 +248,28 @@ pub fn Backend(comptime mode: Mode) type {
             };
         }
 
+        pub fn hostHandle(self: *const Self) ?os.net.fd_t {
+            return switch (mode) {
+                .io_uring => self.engine.io_uring.hostHandle(),
+                .epoll => self.engine.epoll.hostHandle(),
+                .auto => switch (self.engine) {
+                    .io_uring => |*engine| engine.hostHandle(),
+                    .epoll => |*engine| engine.hostHandle(),
+                },
+            };
+        }
+
+        pub fn hasPendingChanges(self: *const Self) bool {
+            return switch (mode) {
+                .io_uring => self.engine.io_uring.hasPendingChanges(),
+                .epoll => self.engine.epoll.hasPendingChanges(),
+                .auto => switch (self.engine) {
+                    .io_uring => |*engine| engine.hasPendingChanges(),
+                    .epoll => |*engine| engine.hasPendingChanges(),
+                },
+            };
+        }
+
         pub fn submit(self: *Self, state: *LoopState, comptime op: Op, completion: *Completion) void {
             switch (mode) {
                 .io_uring => self.engine.io_uring.submit(state, op, completion),

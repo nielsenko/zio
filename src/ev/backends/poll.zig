@@ -192,6 +192,12 @@ pub fn deinit(self: *Self) void {
     self.poll_fds.deinit(self.allocator);
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    _ = self;
+    return null;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     const byte: [1]u8 = .{1};
@@ -414,6 +420,13 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.inflight > 0;
+}
+
+/// Always false. No registration here waits for a poll. See
+/// `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    _ = self;
+    return false;
 }
 
 /// Submit a completion to the backend - infallible.
