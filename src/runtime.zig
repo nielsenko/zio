@@ -29,6 +29,8 @@ const StackInfo = @import("coro/stack.zig").StackInfo;
 const StackPoolConfig = @import("coro/stack_pool.zig").Config;
 const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
 const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
+const installAltStack = @import("coro/stack.zig").installAltStack;
+const releaseAltStack = @import("coro/stack.zig").releaseAltStack;
 
 const AnyTask = @import("task.zig").AnyTask;
 const TaskPool = @import("task.zig").TaskPool;
@@ -572,6 +574,11 @@ pub const Executor = struct {
     // reset on every switch, see registerTask.
     spawn_streak: u32 = 0,
 
+    // Set once a host drives the executor with `tick` or `bindThread`. Its
+    // main task then runs host code, which spawn backpressure leaves alone,
+    // see registerTask.
+    host_driven: bool = false,
+
     // How many quanta fit in tick_target_ns, re-estimated after each tick from
     // task_ns_ewma. Counting against this approximates a time-based poll
     // interval without reading the clock on the hot path.
@@ -643,7 +650,9 @@ pub const Executor = struct {
     // Owning thread only, so no atomics.
     no_suspend: u32 = 0,
 
-    // Executor dedicated to this thread. Written once on init, never updated.
+    // The executor this thread is bound to. Set on init. A host-driven
+    // executor also moves between threads with `tick` and `bindThread`,
+    // see `ThreadBinding`.
     pub threadlocal var current_DO_NOT_ACCESS_DIRECTLY: ?*Executor = null;
 
     /// Get the Executor instance from any coroutine that belongs to it.
@@ -856,6 +865,9 @@ pub const Executor = struct {
 
     /// Run the executor event loop.
     pub fn run(self: *Executor, mode: RunMode) !void {
+        // A host's thread runs code of the host's between runs, see `tick`.
+        // Other executors got the stack in `init`.
+        if (self.host_driven) try installAltStack();
         const check_ready = mode != .until_stopped;
 
         // The run loop is scheduler code, not a task: clear current_task so any I/O
@@ -884,15 +896,7 @@ pub const Executor = struct {
         self.tick_started_at = Timestamp.now(.monotonic);
 
         while (true) {
-            // Process ready coroutines
-            while (self.getNextTask()) |next_task| {
-                updateParentContext(next_task, &self.main_task.coro.context);
-                self.current_task = next_task;
-                self.spawn_streak = 0;
-                next_task.coro.step();
-                self.current_task = null;
-                self.processCleanup();
-            }
+            self.drainReady();
 
             // Quanta spent this cycle mean tasks ran here: a busy executor
             // can't watch for stuck tasks, so it gives up the rescue baton.
@@ -947,6 +951,174 @@ pub const Executor = struct {
                 return;
             }
         }
+    }
+
+    /// One pass of the run loop for a host that owns the thread and drives the
+    /// executor from its own event loop. The ready tasks run, the loop polls
+    /// for at most `wait_cap`, and the tasks that completions readied run.
+    /// Then control returns to the caller, which is the main task. Nothing
+    /// parks and nothing steals, so a caller that passes `.zero` never
+    /// blocks.
+    ///
+    /// Returns true when work remains for the next pass. That is ready tasks
+    /// that outran the tick budget, or completions the poll left queued. A
+    /// group member that finishes cancels its siblings, and those finish on
+    /// the next poll. The host then calls again before it waits on anything
+    /// else.
+    ///
+    /// Binds the executor to the calling thread for the call, see
+    /// `bindThread`, and gives the thread back the binding it had before.
+    /// A host may run its loop on a different OS thread from one call to
+    /// the next, as a Dart isolate does. A thread that ticked then keeps
+    /// nothing that would make zio treat it as the executor's thread. A
+    /// thread the host bound to this executor itself stays as it is.
+    ///
+    /// Before its first task runs, a tick makes sure the thread has the
+    /// alternate signal stack that stack growth needs, std's per-thread one
+    /// unless the thread has one already. Anything may have run on the
+    /// thread since the last tick, so every tick that runs tasks asks the
+    /// kernel again. A tick that runs none asks nothing.
+    ///
+    /// Two things tell the host when to call again without spinning.
+    /// `loop.hostHandle` is a descriptor that becomes readable when the
+    /// loop has events. `loop.nextTimerDeadline` is the longest the host
+    /// may wait on that descriptor before a timer is due.
+    ///
+    /// Returns `error.AlreadyRunning` when one of this executor's tasks, or
+    /// its scheduler, is already on the calling thread's stack. A task can
+    /// get there through a modal loop that pumps the host's events, and so
+    /// the host's tick callback. The host skips that tick, and the tasks run
+    /// once the task that entered the modal loop yields.
+    pub fn tick(self: *Executor, wait_cap: Duration) !bool {
+        const previous = ThreadBinding.current();
+        const rebind = previous.executor != self;
+        if (!rebind and self.current_task != &self.main_task) return error.AlreadyRunning;
+        if (rebind) try self.bindThread();
+        defer if (rebind) previous.restore();
+        self.markHostDriven();
+
+        // Scheduler code, not a task. See `run`.
+        self.current_task = null;
+        defer self.current_task = &self.main_task;
+        defer self.spawn_streak = 0;
+
+        self.processCleanup();
+
+        // The host waited somewhere else since the last poll, and a timeout
+        // a task arms before this tick's poll counts from the snapshot.
+        self.loop.updateNow();
+
+        // A fresh tick budget per pass. The host decides the cadence, so
+        // the per-quantum estimate `run` keeps across its batches has
+        // nothing to retune against here.
+        self.tick_started_at = self.loop.now();
+        self.tick_task_count = 0;
+        self.tick_expired = false;
+        self.tick_checkpoint_countdown = checkpoint_interval;
+
+        // Take the wakes handed out since the last pass before the ready
+        // tasks run, so what those tasks park lands in this pass's poll.
+        var stack_checked = false;
+        _ = self.checkLocalWork(false);
+        try self.drainTick(&stack_checked);
+        // A busy ring takes a few overflow tasks per check, a share sized
+        // for the many passes of `run`. A tick is one pass, so with no
+        // other executor to steal them, this one takes the rest up to the
+        // tick budget.
+        if (migrates and !self.runtime.stealingActive()) {
+            while (self.tickBudgetLeft() and self.run_queue.refill(self.overflowBatch(), .block) > 0) {
+                try self.drainTick(&stack_checked);
+            }
+        }
+        // Tasks the tick budget held back are ready now. So are tasks whose
+        // operation finished inside `loop.add`, with the wake handed out
+        // and not yet taken. Nothing wakes the loop for either, so the poll
+        // must not wait.
+        const runnable = self.loop.hasDispatched() or
+            !self.run_queue.isEmpty() or
+            !self.run_queue.overflow.isEmpty();
+        try self.loop.poll(if (runnable) .zero else wait_cap);
+        // A task that runs here can finish a completion the loop hands out
+        // inline, which wakes another task. Take those wakes in this pass
+        // too, a few times over, and leave the rest for the next one. The
+        // check also refills the ring from the overflow queue, where the
+        // wakes of other threads during the poll went.
+        var pass: usize = 0;
+        while (pass < 4 and self.tickBudgetLeft() and self.checkLocalWork(false)) : (pass += 1) {
+            try self.drainTick(&stack_checked);
+        }
+        return !self.run_queue.isEmpty() or
+            !self.run_queue.overflow.isEmpty() or
+            self.loop.hasPendingWork();
+    }
+
+    /// Makes the calling thread the one this executor runs on. zio calls on
+    /// it then act for the main task, so a blocking call such as a task
+    /// handle's `cancel` runs the executor here until it can return.
+    /// Binding is a few thread-local writes. The alternate signal stack that
+    /// stack growth needs comes from whatever runs tasks on the thread
+    /// later, see `tick`.
+    ///
+    /// `tick` binds by itself. A host calls this when it needs a binding
+    /// outside a tick, to cancel tasks or to deinitialize the runtime on a
+    /// thread other than the one that initialized it. A wake on a bound
+    /// thread, such as an `Event.set`, lands in the executor's own run
+    /// queue for the next tick and wakes nothing. Two threads must not
+    /// act for the executor at once, so the host calls `unbindThread` on a
+    /// thread it is done with.
+    pub fn bindThread(self: *Executor) !void {
+        self.loop.adoptThread();
+        self.main_task.coro.setCurrent();
+        setCurrentExecutor(self);
+        self.markHostDriven();
+    }
+
+    /// Records that a host drives this executor, see `host_driven`.
+    fn markHostDriven(self: *Executor) void {
+        if (self.host_driven) return;
+        self.host_driven = true;
+        if (migrates) _ = self.runtime.stealing.host_mask.fetchOr(@as(usize, 1) << self.id, .release);
+    }
+
+    /// Ends the calling thread's binding, from `bindThread` or from
+    /// `Runtime.init`. A host whose thread may change unbinds the one it
+    /// initialized the runtime on once it is done with it there. Otherwise
+    /// zio calls made later on that thread would still act for the main
+    /// task. Asserts the thread is bound to this executor.
+    pub fn unbindThread(self: *Executor) void {
+        assert(getCurrentExecutorOrNull() == self);
+        ThreadBinding.none.restore();
+    }
+
+    /// Runs the ready tasks until the ring is empty or the tick budget is
+    /// spent.
+    fn drainReady(self: *Executor) void {
+        while (self.getNextTask()) |next_task| {
+            updateParentContext(next_task, &self.main_task.coro.context);
+            self.current_task = next_task;
+            self.spawn_streak = 0;
+            next_task.coro.step();
+            self.current_task = null;
+            self.processCleanup();
+        }
+    }
+
+    /// `drainReady` for a tick. Before the tick's first task runs, makes
+    /// sure the thread has the alternate signal stack that stack growth
+    /// needs, see `tick`.
+    fn drainTick(self: *Executor, stack_checked: *bool) !void {
+        if (!stack_checked.* and self.hasReadyTask()) {
+            try installAltStack();
+            stack_checked.* = true;
+        }
+        self.drainReady();
+    }
+
+    /// Whether `getNextTask` has a task to hand out, the tick budget aside.
+    fn hasReadyTask(self: *Executor) bool {
+        if (!self.run_queue.isEmpty()) return true;
+        // Pinned, the ring takes from the overflow queue once it runs dry.
+        return !migrates and !self.run_queue.overflow.isEmpty();
     }
 
     /// One idle step per call; the run loop re-checks stopped/main-ready/local
@@ -1075,9 +1247,8 @@ pub const Executor = struct {
     /// executors are all parked holds no baton and wakes nobody.
     fn holdBaton(self: *Executor) bool {
         if (!migrates) return false;
-        const executors = self.runtime.executors.items.len;
-        const all: usize = if (executors >= @bitSizeOf(usize)) std.math.maxInt(usize) else (@as(usize, 1) << @intCast(executors)) - 1;
-        if (self.runtime.stealing.idle_mask.load(.acquire) & all == all) {
+        const watched = self.runtime.watchedExecutors();
+        if (self.runtime.stealing.idle_mask.load(.acquire) & watched == watched) {
             if (!self.stealing.holds_baton) return false;
             self.releaseBaton();
             // An executor may be leaving its park right now, having read the
@@ -1085,7 +1256,7 @@ pub const Executor = struct {
             // bit clear and baton load in park and passBaton: either it sees
             // the release and passes the baton on, or this sees its cleared
             // bit and takes the baton back.
-            if (self.runtime.stealing.idle_mask.load(.seq_cst) & all == all) return false;
+            if (self.runtime.stealing.idle_mask.load(.seq_cst) & watched == watched) return false;
         }
         if (self.stealing.holds_baton) return true;
         if (self.runtime.stealing.baton.cmpxchgStrong(0, @as(u32, self.id) + 1, .acq_rel, .monotonic) != null) return false;
@@ -1115,8 +1286,7 @@ pub const Executor = struct {
         // Only executors that aren't parked can be stuck in a task; a parked
         // one may just be taking the task its own completions queued.
         const executors = self.runtime.executors.items;
-        const all: usize = if (executors.len >= @bitSizeOf(usize)) std.math.maxInt(usize) else (@as(usize, 1) << @intCast(executors.len)) - 1;
-        var busy = all & ~self.runtime.stealing.idle_mask.load(.acquire) & ~(@as(usize, 1) << self.id);
+        var busy = self.runtime.watchedExecutors() & ~self.runtime.stealing.idle_mask.load(.acquire) & ~(@as(usize, 1) << self.id);
         while (busy != 0) : (busy &= busy - 1) {
             const victim = executors[@ctz(busy)];
             const head = victim.run_queue.headCursor();
@@ -1539,6 +1709,34 @@ noinline fn setCurrentExecutor(current: ?*Executor) void {
     Executor.current_DO_NOT_ACCESS_DIRECTLY = current;
 }
 
+/// The thread-locals that bind a thread to an executor: the executor that
+/// zio calls on the thread act for, the coroutine the stack-growth handler
+/// looks up, and the loop the debug ownership checks expect. A tick saves
+/// them and puts them back, so a host thread is left as it was found.
+const ThreadBinding = struct {
+    executor: ?*Executor,
+    coroutine: ?*Coroutine,
+    loop: ev.Loop.ThreadOwner,
+
+    const none: ThreadBinding = .{ .executor = null, .coroutine = null, .loop = ev.Loop.no_owner };
+
+    fn current() ThreadBinding {
+        return .{
+            .executor = getCurrentExecutorOrNull(),
+            .coroutine = Coroutine.getCurrent(),
+            .loop = ev.Loop.threadOwner(),
+        };
+    }
+
+    fn restore(self: ThreadBinding) void {
+        setCurrentExecutor(self.executor);
+        if (self.coroutine) |coroutine| coroutine.setCurrent() else Coroutine.clearCurrent();
+        ev.Loop.setThreadOwner(self.loop);
+        // A thread that runs no executor runs no coroutines either.
+        if (self.executor == null) releaseAltStack();
+    }
+};
+
 /// Get the current thread's executor.
 /// Panics if called from a thread without an active executor context.
 pub fn getCurrentExecutor() *Executor {
@@ -1840,7 +2038,18 @@ pub const Runtime = struct {
         /// Id + 1 of the executor holding the rescue baton, or 0 (see
         /// Executor.park).
         baton: std.atomic.Value(u32) = .init(0),
+        /// One bit per executor a host drives, see `watchedExecutors`.
+        host_mask: std.atomic.Value(usize) = .init(0),
     } else struct {};
+
+    /// The executors the rescue baton looks after. A host-driven one is
+    /// left out. Its tasks wait for the host's next tick, not behind a
+    /// task that never yields, and no parked executor sees it go idle.
+    fn watchedExecutors(self: *Runtime) usize {
+        const executors = self.executors.items.len;
+        const all: usize = if (executors >= @bitSizeOf(usize)) std.math.maxInt(usize) else (@as(usize, 1) << @intCast(executors)) - 1;
+        return all & ~self.stealing.host_mask.load(.acquire);
+    }
 
     const WorkerStart = enum { wait, run, abort };
 
@@ -2548,6 +2757,276 @@ test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker"
 
     handle.cancel(); // requests cancellation and waits for completion
     try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
+test "Executor.tick: a host drives a sleeping task to completion" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(done: *bool) !void {
+            try sleep(.fromMilliseconds(20));
+            done.* = true;
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{&done});
+    defer handle.cancel();
+
+    // Each tick waits at most 1ms, so the 20ms sleep takes several.
+    var ticks: usize = 0;
+    const start = Timestamp.now(.monotonic);
+    while (!done) : (ticks += 1) {
+        _ = try runtime.main_executor.tick(.fromMilliseconds(1));
+        try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 2000);
+    }
+    try std.testing.expect(ticks >= 2);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() >= 20);
+}
+
+test "Executor.tick: a zero wait returns at once with nothing ready" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const start = Timestamp.now(.monotonic);
+    const more = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!more);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 100);
+}
+
+test "Executor.tick: tasks the tick budget held back cut the wait short" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run() !void {
+            while (true) try yield();
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+
+    const start = Timestamp.now(.monotonic);
+    try std.testing.expect(try runtime.main_executor.tick(.fromSeconds(2)));
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+}
+
+test "Executor.tick: ready tasks run before the poll and after it" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(counter: *u32) void {
+            counter.* += 1;
+        }
+    };
+    var counter: u32 = 0;
+    var a = try runtime.spawn(Task.run, .{&counter});
+    defer a.cancel();
+    var b = try runtime.spawn(Task.run, .{&counter});
+    defer b.cancel();
+
+    _ = try runtime.main_executor.tick(.zero);
+
+    try std.testing.expectEqual(2, counter);
+}
+
+test "Executor.tick: what a host spawns between ticks waits for the next tick" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const Task = struct {
+        fn run(counter: *u32) void {
+            counter.* += 1;
+        }
+    };
+    var counter: u32 = 0;
+    var handles: [2 * @import("task.zig").spawn_streak_limit]JoinHandle(void) = undefined;
+    for (&handles) |*handle| handle.* = try runtime.spawn(Task.run, .{&counter});
+    defer for (&handles) |*handle| handle.cancel();
+    try std.testing.expectEqual(0, counter);
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expectEqual(handles.len, counter);
+}
+
+test "Executor.tick: a busy ring still takes what other threads woke, up to the tick budget" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const Parked = struct {
+        fn run(event: *Event, woken: *u32) void {
+            event.wait() catch return;
+            woken.* += 1;
+        }
+    };
+    const Task = struct {
+        fn run() void {}
+    };
+    var event = Event.init;
+    var woken: u32 = 0;
+    var waiters: [32]JoinHandle(void) = undefined;
+    for (&waiters) |*waiter| waiter.* = try runtime.spawn(Parked.run, .{ &event, &woken });
+    defer for (&waiters) |*waiter| waiter.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    // The wakes of a thread outside the runtime go to the overflow queue.
+    const setter = try std.Thread.spawn(.{}, Event.set, .{&event});
+    setter.join();
+    // A task in the ring when the tick starts makes it busy.
+    var busy = try runtime.spawn(Task.run, .{});
+    defer busy.cancel();
+    // `run` retuned the budget while the waiters started, to a few tasks on
+    // a slow machine, and the test needs room for all of them.
+    comptime std.debug.assert(Executor.initial_tick_budget > waiters.len);
+    runtime.main_executor.tick_task_budget = Executor.initial_tick_budget;
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expectEqual(waiters.len, woken);
+}
+
+test "Executor.tick: a timeout armed before the poll counts from the tick, not from the host's wait" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const Task = struct {
+        fn run() !void {
+            var timer = ev.Timer.init(.{ .duration = .fromSeconds(10) });
+            try common.timedWaitForIo(&timer.c, .fromMilliseconds(500));
+        }
+    };
+    // The host waits in its own loop, longer than the timeout.
+    os.time.sleep(.fromMilliseconds(600));
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!handle.hasResult());
+}
+
+test "Executor.tick: an operation that finishes inside loop.add cuts the wait short" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const Task = struct {
+        fn run(opened: *bool) !void {
+            // Every backend opens a socket inside `loop.add`. The task
+            // parks with its wake already handed out.
+            const socket = try net.Socket.open(.stream, .ipv4, .ip);
+            opened.* = true;
+            socket.close();
+        }
+    };
+    var opened = false;
+    var handle = try runtime.spawn(Task.run, .{&opened});
+    defer handle.cancel();
+
+    const start = Timestamp.now(.monotonic);
+    _ = try runtime.main_executor.tick(.fromSeconds(2));
+    try std.testing.expect(opened);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+}
+
+test "Executor.tick: a task another thread wakes during the poll runs in the same tick" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const Task = struct {
+        fn run(event: *Event, done: *bool) !void {
+            try event.wait();
+            done.* = true;
+        }
+    };
+    const Setter = struct {
+        fn run(event: *Event) void {
+            os.time.sleep(.fromMilliseconds(50));
+            event.set();
+        }
+    };
+    var event = Event.init;
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ &event, &done });
+    defer handle.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{&event});
+    defer setter.join();
+    _ = try runtime.main_executor.tick(.fromSeconds(2));
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: an idle worker holds no rescue baton while a host drives the main executor" {
+    if (!migrates or builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+    _ = try runtime.main_executor.tick(.zero);
+
+    // A worker that holds the baton parks for baton_tick at most, so a
+    // few of those let it see the host's executor and let the baton go.
+    const start = Timestamp.now(.monotonic);
+    while (runtime.stealing.baton.load(.acquire) != 0) {
+        try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+        os.time.sleep(Executor.baton_tick);
+    }
+    os.time.sleep(.fromMilliseconds(5 * Executor.baton_tick.toMilliseconds()));
+    try std.testing.expectEqual(0, runtime.stealing.baton.load(.acquire));
+}
+
+test "Executor.tick: a tick from inside one of the executor's own tasks fails" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Other = struct {
+        fn run(ran: *bool) void {
+            ran.* = true;
+        }
+    };
+    const Task = struct {
+        fn run(rt: *Runtime, ran: *bool) !void {
+            var other = try rt.spawn(Other.run, .{ran});
+            defer other.cancel();
+            const task = getCurrentTask();
+            try std.testing.expectError(error.AlreadyRunning, getCurrentExecutor().tick(.zero));
+            try std.testing.expectEqual(task, getCurrentTask());
+            try yield();
+            try std.testing.expect(ran.*);
+        }
+    };
+    var ran = false;
+    var handle = try runtime.spawn(Task.run, .{ runtime, &ran });
+    while (try runtime.main_executor.tick(.zero)) {}
+    try handle.join();
+}
+
+test "Loop: the host handle and the next timer deadline" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+
+    // The runtime may keep timers of its own, so the test claims only
+    // this. Once the sleep is armed, the next deadline is at most its 30ms.
+    const Task = struct {
+        fn run() !void {
+            try sleep(.fromMilliseconds(30));
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const deadline = loop.nextTimerDeadline().?;
+    try std.testing.expect(deadline.toMilliseconds() <= 30);
+    // A Windows handle is a SOCKET, and no Windows backend has one.
+    if (builtin.os.tag != .windows) {
+        if (loop.hostHandle()) |fd| try std.testing.expect(fd >= 0);
+    }
 }
 
 test "Runtime: implicit run" {

@@ -864,7 +864,7 @@ const getPlacementExecutor = @import("runtime.zig").getPlacementExecutor;
 const Placement = @import("runtime.zig").Placement;
 
 /// Spawns a task may make without switching out before it yields.
-const spawn_streak_limit = 13;
+pub const spawn_streak_limit = 13;
 
 /// Register a task with the runtime and schedule it for execution.
 /// Returns error.RuntimeShutdown if the runtime is shutting down.
@@ -884,9 +884,12 @@ pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
         if (current_executor.runtime == rt) {
             // Spawn backpressure: lets the new tasks start before the spawner
             // piles up more. Only needed when no other executor can steal the
-            // backlog.
+            // backlog. A host's main task runs host code between ticks, where
+            // a yield would run a pass the host did not ask for. What it
+            // spawns runs in its next tick.
             if (!rt.stealingActive()) {
                 if (current_executor.current_task) |spawner| {
+                    if (spawner == &current_executor.main_task and current_executor.host_driven) return;
                     current_executor.spawn_streak += 1;
                     if (current_executor.spawn_streak >= spawn_streak_limit) {
                         spawner.yield(.reschedule, .no_cancel);

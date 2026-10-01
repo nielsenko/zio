@@ -398,6 +398,31 @@ test "AcceptHints: insert, find and remove across collisions" {
     try std.testing.expect(t.contains(100 + AcceptHints.size));
 }
 
+test "io_uring: a waker poll the kernel ended is pending work until a poll arms it again" {
+    const Loop = @import("../../loop.zig").Loop;
+    const Timer = @import("../../completion.zig").Timer;
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    const engine = switch (loop.backend.engine) {
+        .io_uring => |*engine| engine,
+        .epoll => return error.SkipZigTest,
+    };
+    // A loop with nothing to do skips its poll.
+    var keep_alive: Timer = .init(.{ .duration = .zero });
+    loop.setTimer(&keep_alive, .{ .duration = .fromSeconds(60) });
+    defer _ = loop.clearTimer(&keep_alive);
+    try loop.poll(.zero);
+    try std.testing.expect(!loop.hasPendingWork());
+
+    // The kernel ends a multishot poll with a CQE that lacks F_MORE.
+    engine.drainWaker(.{ .user_data = specialUd(.waker, 0), .res = 0, .flags = 0 });
+    try std.testing.expect(loop.hasPendingWork());
+
+    try loop.poll(.zero);
+    try std.testing.expect(!loop.hasPendingWork());
+}
+
 const Self = @This();
 
 const log = @import("../../../common.zig").log;
@@ -531,6 +556,11 @@ pub fn deinit(self: *Self) void {
     }
 }
 
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    return self.ring.fd;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     posix.eventfd_write(self.waker_eventfd, 1) catch {};
@@ -568,6 +598,15 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.inflight > 0;
+}
+
+/// Whether the next poll has something to submit: queued submission
+/// entries, or the waker's multishot poll, which only a poll arms again.
+/// Until then no wake reaches the ring. See `Loop.hasPendingWork`.
+pub fn hasPendingChanges(self: *const Self) bool {
+    if (self.waker_needs_rearm) return true;
+    // `IoUring.sq_ready` computes the same, but takes a mutable ring.
+    return self.ring.sq.sqe_tail -% @atomicLoad(u32, self.ring.sq.head, .acquire) > 0;
 }
 
 /// Submit a completion to the backend - infallible.
