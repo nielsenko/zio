@@ -1163,6 +1163,26 @@ test "CompletionQueue: submitAndWait times out and cancels the operation" {
     try std.testing.expectError(error.Canceled, timer.getResult());
 }
 
+test "CompletionQueue: submitAndWait with a timeout runs no callback the completion carried" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Callback = struct {
+        fn run(_: *ev.Loop, c: *Completion) void {
+            const called: *bool = @ptrCast(@alignCast(c.userdata.?));
+            called.* = true;
+        }
+    };
+    var called = false;
+    var timer = ev.Timer.init(.{ .duration = .fromMilliseconds(1) });
+    timer.c.callback = Callback.run;
+    timer.c.userdata = &called;
+
+    try CompletionQueue.submitAndWait(&timer.c, .fromSeconds(10));
+    try timer.getResult();
+    try std.testing.expect(!called);
+}
+
 test "CompletionQueue: canceling submitAndWait cancels the operation" {
     var rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
