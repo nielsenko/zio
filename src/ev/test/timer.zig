@@ -8,6 +8,7 @@ const FileReadStreaming = @import("../completion.zig").FileReadStreaming;
 const ReadBuf = @import("../buf.zig").ReadBuf;
 const fs = @import("../../os/fs.zig");
 const posix = @import("../../os/posix.zig");
+const options = @import("../../options.zig").options;
 
 test "setTimer and clearTimer basic" {
     var loop: Loop = undefined;
@@ -28,6 +29,42 @@ test "setTimer and clearTimer basic" {
     try std.testing.expect(elapsed.toMilliseconds() >= 90);
     try std.testing.expect(elapsed.toMilliseconds() <= 250);
     std.log.info("setTimer: expected=100ms, actual={f}", .{elapsed});
+}
+
+test "a loop is run by a thread other than the one that created it" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    // A SINGLE_ISSUER ring refuses every thread but its creator. The Linux
+    // backend picks io_uring at runtime unless one is named.
+    if (builtin.os.tag == .linux and options.io_uring_single_issuer) {
+        const backend = options.backend orelse .linux;
+        if (backend == .linux or backend == .io_uring) return error.SkipZigTest;
+    }
+
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    const Runner = struct {
+        fn run(l: *Loop, failed: *bool) void {
+            l.run() catch {
+                failed.* = true;
+            };
+        }
+    };
+
+    var first: Timer = .init(.{ .duration = .zero });
+    loop.setTimer(&first, .{ .duration = .fromMilliseconds(10) });
+    var failed = false;
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ &loop, &failed });
+    thread.join();
+    try std.testing.expect(!failed);
+    try std.testing.expectEqual(.dead, first.c.loadState().phase);
+
+    // And back on the creating thread.
+    var second: Timer = .init(.{ .duration = .zero });
+    loop.setTimer(&second, .{ .duration = .fromMilliseconds(10) });
+    try loop.run();
+    try std.testing.expectEqual(.dead, second.c.loadState().phase);
 }
 
 test "clearTimer before expiration" {

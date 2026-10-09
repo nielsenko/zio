@@ -23,6 +23,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
+  `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
+  `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.
+
 - Added `local_address` to `IpAddress.ConnectOptions`, to connect from a specific local
   address.
 

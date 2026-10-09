@@ -61,6 +61,11 @@ pub const Options = struct {
     resolve_beneath_mode: ResolveBeneathMode = buildEnum(ResolveBeneathMode, build_options.resolve_beneath_mode),
     /// Avoid unsafe performance tricks (bool smuggling, etc.).
     no_hacks: bool = build_options.no_hacks,
+    /// Create each io_uring ring with `IORING_SETUP_SINGLE_ISSUER` and
+    /// `IORING_SETUP_DEFER_TASKRUN`. The kernel then lets only the thread
+    /// that created a ring enter it. Turn it off for a host that drives a
+    /// loop from one thread at a time, but not always the same one.
+    io_uring_single_issuer: bool = build_options.io_uring_single_issuer,
     /// Count scheduler events (parks, steals, wake batches) in per-executor
     /// counters readable via `Runtime.schedulerMetrics`.
     scheduler_metrics: bool = build_options.scheduler_metrics,
