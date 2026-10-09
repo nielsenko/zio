@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const scheduling = b.option(BuildOptions.Scheduling, "scheduling", "Scheduling discipline: single_executor, pinned or work_stealing (default work_stealing)");
     const resolve_beneath_mode = b.option(BuildOptions.ResolveBeneathMode, "resolve-beneath-mode", "How to handle resolve_beneath on platforms without kernel support: strict (error.Unsupported) or best_effort (log warning, continue)");
     const no_hacks = b.option(bool, "no-hacks", "Avoid unsafe performance tricks (bool smuggling, etc.)");
+    const io_uring_single_issuer = b.option(bool, "io_uring_single_issuer", "Create io_uring rings with SINGLE_ISSUER and DEFER_TASKRUN, which ties a loop to the thread that created it (default true)");
     const scheduler_metrics = b.option(bool, "scheduler_metrics", "Count scheduler events (parks, steals, wake batches) in per-executor counters readable via Runtime.schedulerMetrics (default true)");
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
 
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
         .scheduling = scheduling orelse .work_stealing,
         .resolve_beneath_mode = resolve_beneath_mode orelse .strict,
         .no_hacks = no_hacks orelse false,
+        .io_uring_single_issuer = io_uring_single_issuer orelse true,
         .scheduler_metrics = scheduler_metrics orelse true,
         .debug_cancel = debug_cancel orelse false,
     };
@@ -136,6 +138,7 @@ const BuildOptions = struct {
     scheduling: Scheduling,
     resolve_beneath_mode: ResolveBeneathMode,
     no_hacks: bool,
+    io_uring_single_issuer: bool,
     scheduler_metrics: bool,
     debug_cancel: bool,
 
@@ -147,6 +150,7 @@ const BuildOptions = struct {
         options.addOption([]const u8, "scheduling", @tagName(self.scheduling));
         options.addOption([]const u8, "resolve_beneath_mode", @tagName(self.resolve_beneath_mode));
         options.addOption(bool, "no_hacks", self.no_hacks);
+        options.addOption(bool, "io_uring_single_issuer", self.io_uring_single_issuer);
         options.addOption(bool, "scheduler_metrics", self.scheduler_metrics);
         options.addOption(bool, "debug_cancel", self.debug_cancel);
         return options;

@@ -14,6 +14,7 @@ BACKEND=""
 SCHEDULING=""
 USE_WINE=false
 USE_QEMU=false
+IO_URING_SHARED=false
 NO_EXEC=false
 COVERAGE=false
 TIMEOUT=""
@@ -21,7 +22,7 @@ NO_LOG_CAPTURE=false
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--verbose] [--no-log-capture] [--timeout <seconds>]"
+  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--io-uring-shared] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--verbose] [--no-log-capture] [--timeout <seconds>]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,6 +52,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --qemu)
             USE_QEMU=true
+            shift
+            ;;
+        --io-uring-shared)
+            IO_URING_SHARED=true
             shift
             ;;
         --no-exec)
@@ -125,6 +130,10 @@ fi
 if [ -n "$BACKEND" ]; then
     echo "Backend: $BACKEND"
     BUILD_ARGS+=("-Dbackend=$BACKEND")
+fi
+if [ "$IO_URING_SHARED" = true ]; then
+    echo "io_uring rings: shared between threads"
+    BUILD_ARGS+=(-Dio_uring_single_issuer=false)
 fi
 if [ "$USE_QEMU" = true ]; then
     BUILD_ARGS+=(-fqemu)

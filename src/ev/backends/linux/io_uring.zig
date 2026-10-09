@@ -8,6 +8,7 @@ const time = @import("../../../os/time.zig");
 const Duration = @import("../../../time.zig").Duration;
 const Clock = @import("../../../time.zig").Clock;
 const common = @import("../common.zig");
+const options = @import("../../../options.zig").options;
 const LoopState = @import("../../loop.zig").LoopState;
 const Completion = @import("../../completion.zig").Completion;
 const Queue = @import("../../queue.zig").Queue;
@@ -459,8 +460,11 @@ accept_hints: AcceptHints = .{},
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
-    flags |= linux.IORING_SETUP_SINGLE_ISSUER;
-    flags |= linux.IORING_SETUP_DEFER_TASKRUN;
+    if (options.io_uring_single_issuer) {
+        // DEFER_TASKRUN needs SINGLE_ISSUER.
+        flags |= linux.IORING_SETUP_SINGLE_ISSUER;
+        flags |= linux.IORING_SETUP_DEFER_TASKRUN;
+    }
     flags |= linux.IORING_SETUP_COOP_TASKRUN;
 
     const master_fd = shared_state.master_fd.load(.seq_cst);
@@ -556,8 +560,11 @@ pub fn deinit(self: *Self) void {
     }
 }
 
-/// See `Loop.hostHandle`.
+/// See `Loop.hostHandle`. None for a `DEFER_TASKRUN` ring, whose
+/// completions wait for its issuer to enter the kernel. A poll of the ring
+/// fd would report them, but nothing wakes the poll.
 pub fn hostHandle(self: *const Self) ?net.fd_t {
+    if (options.io_uring_single_issuer) return null;
     return self.ring.fd;
 }
 
