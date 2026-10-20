@@ -233,8 +233,9 @@ pub const LoopState = struct {
     pool_inflight: usize = 0,
 
     /// Wake requests (`wake_loop`, `wake_async`, `wake_cancel`) plus the
-    /// `sleeping` bit the loop sets before a blocking backend poll. Cleared
-    /// as a whole after every poll. See `requestWake`.
+    /// `sleeping` bit the loop sets before a blocking backend poll, and a
+    /// host before it waits on `Loop.hostHandle`. Cleared as a whole after
+    /// every poll. See `requestWake`.
     wake_requested: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Cached "now" per wall clock, indexed by `clockIndex`. `awake` is
@@ -287,18 +288,20 @@ pub const LoopState = struct {
     pub const wake_loop: u32 = 1;
     pub const wake_async: u32 = 2;
     pub const wake_cancel: u32 = 4;
-    /// Set by the loop just before a blocking backend poll. The top bit,
-    /// apart from the request bits below it.
+    /// Set by the loop just before a blocking backend poll, and by
+    /// `Loop.prepareHostWait`. The top bit, apart from the request bits
+    /// below it.
     pub const sleeping: u32 = 1 << 31;
     const wake_mask: u32 = wake_loop | wake_async | wake_cancel;
 
     /// Record a wake request. Returns true if the caller must also wake the
-    /// backend: the loop is blocked in (or about to enter) its poll and no
-    /// other request has woken it yet. A loop that isn't sleeping picks the
-    /// request up at its next poll without any syscall. Both sides do a single
-    /// read-modify-write on this one word, so they are totally ordered: either
-    /// the loop's `sleeping` comes first and the requester sees it, or the
-    /// request comes first and the loop sees it and doesn't block.
+    /// backend: the loop is blocked in (or about to enter) its poll, or a
+    /// host waits on its handle, and no other request has woken it yet. A
+    /// loop that isn't sleeping picks the request up at its next poll without
+    /// any syscall. Both sides do a single read-modify-write on this one
+    /// word, so they are totally ordered: either the loop's `sleeping` comes
+    /// first and the requester sees it, or the request comes first and the
+    /// loop sees it and doesn't block.
     pub fn requestWake(self: *LoopState, bit: u32) bool {
         return self.wake_requested.fetchOr(bit, .acq_rel) == sleeping;
     }
@@ -647,7 +650,8 @@ pub const Loop = struct {
     }
 
     /// Wake up the loop from another thread (thread-safe). Costs a syscall
-    /// only when the loop is sleeping in its poll and nobody has woken it yet.
+    /// only when the loop is sleeping in its poll, or a host waits on
+    /// `hostHandle`, and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
         if (self.state.requestWake(LoopState.wake_loop)) self.backend.wake(&self.state);
     }
@@ -656,10 +660,23 @@ pub const Loop = struct {
     /// events to process, for a host that drives an executor with
     /// `Executor.tick` from its own event loop. Null on a backend with no
     /// such descriptor, and on io_uring unless `io_uring_single_issuer` is
-    /// off. When it is readable the host calls `tick`. The host must not
-    /// read from it.
+    /// off. The host announces each wait with
+    /// `prepareHostWait`, and calls `tick` when the descriptor is readable.
+    /// The host must not read from it.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
+    }
+
+    /// Announces that the host is about to wait on `hostHandle`. Until the
+    /// next poll, a `wake` from any thread makes the handle readable.
+    /// Returns false when a wake came in since the last poll. The host then
+    /// ticks instead of waiting.
+    ///
+    /// A poll ends the announcement, so a host that keeps waiting across a
+    /// tick announces again after it. Call it between ticks, never during
+    /// one, since a poll that runs at the same time can drop it.
+    pub fn prepareHostWait(self: *Loop) bool {
+        return self.state.wake_requested.fetchOr(LoopState.sleeping, .acq_rel) & LoopState.wake_mask == 0;
     }
 
     /// How long a host may wait on `hostHandle` before a timer is due, or
@@ -1497,8 +1514,12 @@ pub const Loop = struct {
         // Skip the backend poll when not waiting and there's nothing to retrieve.
         // This avoids syscall overhead for pure CPU-bound workloads. A
         // registration the backend has queued still goes through. A host that
-        // parks on `hostHandle` needs it in the kernel first.
-        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges();
+        // parks on `hostHandle` needs it in the kernel first. After a host
+        // announced a wait, a wake may sit in the backend, even one whose
+        // request an earlier poll took. Polling takes it, so the handle goes
+        // quiet.
+        const host_waited = self.state.wake_requested.load(.acquire) & LoopState.sleeping != 0;
+        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges() or host_waited;
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.

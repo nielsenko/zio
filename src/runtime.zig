@@ -854,7 +854,9 @@ pub const Executor = struct {
     /// Two things tell the host when to call again without spinning.
     /// `loop.hostHandle` is a descriptor that becomes readable when the
     /// loop has events. `loop.nextTimerDeadline` is the longest the host
-    /// may wait on that descriptor before a timer is due.
+    /// may wait on that descriptor before a timer is due. The host calls
+    /// `loop.prepareHostWait` right before it waits, so that a wake from
+    /// another thread reaches the descriptor too.
     pub fn tick(self: *Executor, wait_cap: Duration) !bool {
         setCurrentExecutor(self);
         self.loop.adoptThread();
@@ -2505,6 +2507,75 @@ test "Loop: the host handle and the next timer deadline" {
     if (builtin.os.tag != .windows) {
         if (loop.hostHandle()) |fd| try std.testing.expect(fd >= 0);
     }
+}
+
+/// Whether `fd` is readable within `timeout_ms`.
+fn testReadable(fd: os.net.fd_t, timeout_ms: i32) !bool {
+    var fds = [_]os.net.pollfd{.{ .fd = fd, .events = os.net.POLL.IN, .revents = 0 }};
+    return try os.net.poll(&fds, timeout_ms) == 1;
+}
+
+test "Executor.tick: a task woken from another thread makes the host handle readable" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+    const fd = loop.hostHandle() orelse return error.SkipZigTest;
+
+    const Event = @import("sync/Event.zig");
+    const Task = struct {
+        fn run(event: *Event, done: *bool) !void {
+            try event.wait();
+            done.* = true;
+        }
+    };
+    var event = Event.init;
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ &event, &done });
+    defer handle.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    try std.testing.expect(loop.prepareHostWait());
+    const thread = try std.Thread.spawn(.{}, Event.set, .{&event});
+    defer thread.join();
+    const start = Timestamp.now(.monotonic);
+    try std.testing.expect(try testReadable(fd, 2000));
+    // poll checks the handle once more as its timeout ends, so a handle that
+    // turned readable without waking the poll passes the check above. Only
+    // the time it took tells a wake from a timeout.
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: a wake before the host announces its wait means tick again" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+    _ = try runtime.main_executor.tick(.zero);
+
+    loop.wake();
+
+    try std.testing.expect(!loop.prepareHostWait());
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(loop.prepareHostWait());
+}
+
+test "Executor.tick: the tick after a wake leaves the host handle quiet" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+    const fd = loop.hostHandle() orelse return error.SkipZigTest;
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(loop.prepareHostWait());
+    loop.wake();
+    try std.testing.expect(try testReadable(fd, 0));
+
+    _ = try runtime.main_executor.tick(.zero);
+
+    try std.testing.expect(loop.prepareHostWait());
+    try std.testing.expect(!try testReadable(fd, 0));
 }
 
 test "Runtime: implicit run" {
