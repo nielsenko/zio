@@ -2578,6 +2578,83 @@ test "Executor.tick: the tick after a wake leaves the host handle quiet" {
     try std.testing.expect(!try testReadable(fd, 0));
 }
 
+test "Executor.tick: a host may tick from a different thread each time" {
+    if (builtin.single_threaded or builtin.os.tag == .windows) return error.SkipZigTest;
+    // A SINGLE_ISSUER ring refuses every thread but its creator. The Linux
+    // backend picks io_uring at runtime unless one is named.
+    if (builtin.os.tag == .linux and zio_options.io_uring_single_issuer) {
+        const backend = zio_options.backend orelse .linux;
+        if (backend == .linux or backend == .io_uring) return error.SkipZigTest;
+    }
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const fds = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(fds[0]);
+    defer os_net.close(fds[1]);
+
+    // Each read the task submits, it submits on the thread of that tick.
+    const Task = struct {
+        fn run(fd: os_net.fd_t, reads: *std.atomic.Value(u32)) !void {
+            for (0..5) |_| {
+                var buf: [1]u8 = undefined;
+                var iov: [1]os.iovec = undefined;
+                _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .none);
+                _ = reads.fetchAdd(1, .release);
+            }
+        }
+    };
+    const Host = struct {
+        fn tick(executor: *Executor, failed: *bool) void {
+            _ = executor.tick(.fromMilliseconds(5)) catch {
+                failed.* = true;
+            };
+        }
+    };
+    var reads = std.atomic.Value(u32).init(0);
+    var handle = try runtime.spawn(Task.run, .{ fds[0], &reads });
+    defer handle.cancel();
+
+    var failed = false;
+    var threads: usize = 0;
+    while (reads.load(.acquire) < 5) : (threads += 1) {
+        try std.testing.expect(threads < 1000);
+        _ = try os_net.send(fds[1], &.{os.iovecConstFromSlice("x")}, .{});
+        const thread = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &failed });
+        thread.join();
+        try std.testing.expect(!failed);
+    }
+}
+
+test "Executor.tick: a host cancels a task parked in a read, and the runtime shuts down" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const fds = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(fds[0]);
+    defer os_net.close(fds[1]);
+
+    const Task = struct {
+        fn run(fd: os_net.fd_t) !void {
+            var buf: [1]u8 = undefined;
+            var iov: [1]os.iovec = undefined;
+            _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .none);
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{fds[0]});
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!handle.hasResult());
+
+    handle.cancel();
+
+    try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
 test "Runtime: implicit run" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
