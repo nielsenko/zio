@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "coro-demo", .file = "examples/coro_demo.zig" },
         .{ .name = "ev-demo", .file = "examples/ev_demo.zig" },
         .{ .name = "stderr-smoke", .file = "examples/stderr_smoke.zig" },
+        .{ .name = "host-loop", .file = "examples/host_loop.zig" },
     };
 
     // Create examples step. -Dexample=<name> limits it to a single example

@@ -39,6 +39,7 @@ nav:
     - HTTP Server: http-server.md
     - NTP Client: ntp-client.md
     - Parallel Grep: parallel-grep.md
+    - Host Event Loop: host-loop.md
   - Reference:
     - API Documentation: apidocs/
   - Project:

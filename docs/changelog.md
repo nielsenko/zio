@@ -38,6 +38,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Added `Executor.tick`, to drive an executor from a host's own event loop one pass at a
+  time, and `Loop.hostHandle`, `Loop.nextTimerDeadline` and `Loop.prepareHostWait`, to
+  tell the host when to tick again. `Executor.bindThread` and `Executor.unbindThread`
+  move the executor to another thread outside a tick. A tick from inside one of the
+  executor's own tasks returns `error.AlreadyRunning`. See the new Host Event Loop page.
+
 - Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
   `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
   `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.
