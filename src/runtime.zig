@@ -3129,6 +3129,281 @@ test "Executor.tick: the tick after a wake leaves the host handle quiet" {
     try std.testing.expect(!try testReadable(fd, 0));
 }
 
+test "Executor.tick: a host may tick from a different thread each time" {
+    if (builtin.single_threaded or builtin.os.tag == .windows) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const fds = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(fds[0]);
+    defer os_net.close(fds[1]);
+
+    // Each read the task submits, it submits on the thread of that tick.
+    const Task = struct {
+        fn run(fd: os_net.fd_t, reads: *std.atomic.Value(u32)) !void {
+            for (0..5) |_| {
+                var buf: [1]u8 = undefined;
+                var iov: [1]os.iovec = undefined;
+                _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .none);
+                _ = reads.fetchAdd(1, .release);
+            }
+        }
+    };
+    const Host = struct {
+        fn tick(executor: *Executor, failed: *bool) void {
+            _ = executor.tick(.fromMilliseconds(5)) catch {
+                failed.* = true;
+            };
+        }
+    };
+    var reads = std.atomic.Value(u32).init(0);
+    var handle = try runtime.spawn(Task.run, .{ fds[0], &reads });
+    defer handle.cancel();
+
+    var failed = false;
+    var threads: usize = 0;
+    while (reads.load(.acquire) < 5) : (threads += 1) {
+        try std.testing.expect(threads < 1000);
+        _ = try os_net.send(fds[1], &.{os.iovecConstFromSlice("x")}, .{});
+        const thread = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &failed });
+        thread.join();
+        try std.testing.expect(!failed);
+    }
+}
+
+test "Executor.tick: a host cancels a task parked in a read, and the runtime shuts down" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const fds = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(fds[0]);
+    defer os_net.close(fds[1]);
+
+    const Task = struct {
+        fn run(fd: os_net.fd_t) !void {
+            var buf: [1]u8 = undefined;
+            var iov: [1]os.iovec = undefined;
+            _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .none);
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{fds[0]});
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!handle.hasResult());
+
+    handle.cancel();
+
+    try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
+/// Whether the loop is a SINGLE_ISSUER io_uring ring, which refuses every
+/// thread but the one that created it. The Linux backend picks io_uring at
+/// runtime unless one is named.
+fn ringRefusesOtherThreads() bool {
+    if (builtin.os.tag != .linux or !zio_options.io_uring_single_issuer) return false;
+    const backend = zio_options.backend orelse .linux;
+    return backend == .linux or backend == .io_uring;
+}
+
+test "Executor.tick: a thread keeps the binding it had before the tick" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Host = struct {
+        fn tick(executor: *Executor, after: *ThreadBinding, failed: *bool) void {
+            _ = executor.tick(.zero) catch {
+                failed.* = true;
+            };
+            after.* = ThreadBinding.current();
+        }
+    };
+    var after: ThreadBinding = undefined;
+    var failed = false;
+    const thread = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &after, &failed });
+    thread.join();
+    try std.testing.expect(!failed);
+    try std.testing.expectEqual(null, after.executor);
+    try std.testing.expectEqual(null, after.coroutine);
+
+    // The thread that initialized the runtime stays bound to it.
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expectEqual(&runtime.main_executor, getCurrentExecutorOrNull());
+    try std.testing.expectEqual(&runtime.main_executor.main_task.coro, Coroutine.getCurrent());
+}
+
+test "Executor.tick: a task grows its stack on a thread that never ran an executor" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn recurse(depth: u32) u8 {
+            var buffer: [1024]u8 = undefined;
+            @memset(&buffer, @truncate(depth));
+            // Escaping, the buffer stays in each frame in every build mode.
+            std.mem.doNotOptimizeAway(&buffer);
+            if (depth == 0) return buffer[0];
+            return recurse(depth - 1) +% buffer[0];
+        }
+
+        // A MiB of frames, past the 256 KiB a stack starts with.
+        fn run(done: *bool) void {
+            std.mem.doNotOptimizeAway(recurse(1024));
+            done.* = true;
+        }
+    };
+    const Host = struct {
+        fn tick(executor: *Executor, result: *anyerror!void) void {
+            result.* = dropAltStackAndTick(executor);
+        }
+
+        /// A thread from `std.Thread` has an alternate signal stack. A
+        /// host's own thread need not, so this one gives its stack up.
+        fn dropAltStackAndTick(executor: *Executor) !void {
+            if (builtin.os.tag != .windows and builtin.os.tag != .openbsd) {
+                // macOS wants a valid size even to disable a stack.
+                var disable = os.posix.stack_t{ .flags = os.posix.SS.DISABLE, .sp = null, .size = os.posix.MINSIGSTKSZ };
+                try os.posix.sigaltstack(&disable, null);
+            }
+            _ = try executor.tick(.zero);
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{&done});
+    defer handle.cancel();
+
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &result });
+    thread.join();
+    try result;
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: a task grows its stack after the host took the thread's signal stack away between ticks" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn recurse(depth: u32) u8 {
+            var buffer: [1024]u8 = undefined;
+            @memset(&buffer, @truncate(depth));
+            // Escaping, the buffer stays in each frame in every build mode.
+            std.mem.doNotOptimizeAway(&buffer);
+            if (depth == 0) return buffer[0];
+            return recurse(depth - 1) +% buffer[0];
+        }
+
+        // A MiB of frames, past the 256 KiB a stack starts with.
+        fn deep(done: *bool) void {
+            std.mem.doNotOptimizeAway(recurse(1024));
+            done.* = true;
+        }
+
+        fn shallow(ran: *bool) void {
+            ran.* = true;
+        }
+    };
+    const Host = struct {
+        fn run(rt: *Runtime, ran: *bool, done: *bool, result: *anyerror!void) void {
+            result.* = tickTwice(rt, ran, done);
+        }
+
+        fn tickTwice(rt: *Runtime, ran: *bool, done: *bool) !void {
+            _ = try rt.main_executor.tick(.zero);
+            try std.testing.expect(ran.*);
+            // What the host's own code may do with its thread between ticks.
+            var disable = os.posix.stack_t{ .flags = os.posix.SS.DISABLE, .sp = null, .size = os.posix.MINSIGSTKSZ };
+            try os.posix.sigaltstack(&disable, null);
+            var deep = try rt.spawn(Task.deep, .{done});
+            _ = try rt.main_executor.tick(.zero);
+            deep.join();
+        }
+    };
+    var ran = false;
+    var done = false;
+    var shallow = try runtime.spawn(Task.shallow, .{&ran});
+    defer shallow.cancel();
+
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Host.run, .{ runtime, &ran, &done, &result });
+    thread.join();
+    try result;
+    try std.testing.expect(done);
+}
+
+test "Executor.bindThread: binding a thread leaves its signal stack alone" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Host = struct {
+        fn run(executor: *Executor, result: *anyerror!bool) void {
+            result.* = bindWithoutStack(executor);
+        }
+
+        /// Whether the thread still has no signal stack while it is bound.
+        fn bindWithoutStack(executor: *Executor) !bool {
+            var disable = os.posix.stack_t{ .flags = os.posix.SS.DISABLE, .sp = null, .size = os.posix.MINSIGSTKSZ };
+            try os.posix.sigaltstack(&disable, null);
+            try executor.bindThread();
+            defer executor.unbindThread();
+            var current: os.posix.stack_t = undefined;
+            try os.posix.sigaltstack(null, &current);
+            return current.flags & os.posix.SS.DISABLE != 0;
+        }
+    };
+    var result: anyerror!bool = error.NotRun;
+    const thread = try std.Thread.spawn(.{}, Host.run, .{ &runtime.main_executor, &result });
+    thread.join();
+    try std.testing.expect(try result);
+}
+
+test "Executor.bindThread: a host shuts down on a thread it binds" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    runtime.main_executor.unbindThread();
+    try std.testing.expectEqual(null, getCurrentExecutorOrNull());
+    try std.testing.expectEqual(null, Coroutine.getCurrent());
+
+    const Task = struct {
+        fn run() !void {
+            try sleep(.fromSeconds(10));
+        }
+    };
+    const Host = struct {
+        fn shutDown(rt: *Runtime) !void {
+            try rt.main_executor.bindThread();
+            var handle = try rt.spawn(Task.run, .{});
+            _ = try rt.main_executor.tick(.zero);
+            try std.testing.expect(!handle.hasResult());
+            handle.cancel();
+            try std.testing.expectError(error.Canceled, handle.getResult());
+            rt.deinit();
+        }
+
+        fn run(rt: *Runtime, result: *anyerror!void) void {
+            result.* = shutDown(rt);
+        }
+    };
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Host.run, .{ runtime, &result });
+    thread.join();
+    try result;
+}
+
 test "Runtime: implicit run" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
