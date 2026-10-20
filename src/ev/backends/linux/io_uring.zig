@@ -444,8 +444,11 @@ pub fn deinit(self: *Self) void {
     }
 }
 
-/// See `Loop.hostHandle`.
+/// See `Loop.hostHandle`. None for a `DEFER_TASKRUN` ring, whose
+/// completions wait for its issuer to enter the kernel. A poll of the ring
+/// fd would report them, but nothing wakes the poll.
 pub fn hostHandle(self: *const Self) ?net.fd_t {
+    if (options.io_uring_single_issuer) return null;
     return self.ring.fd;
 }
 

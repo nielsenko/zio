@@ -655,8 +655,9 @@ pub const Loop = struct {
     /// A descriptor a host thread can wait on to learn that the loop has
     /// events to process, for a host that drives an executor with
     /// `Executor.tick` from its own event loop. Null on a backend with no
-    /// such descriptor. When it is readable the host calls `tick`. The host
-    /// must not read from it.
+    /// such descriptor, and on io_uring unless `io_uring_single_issuer` is
+    /// off. When it is readable the host calls `tick`. The host must not
+    /// read from it.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
     }
