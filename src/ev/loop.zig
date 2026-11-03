@@ -742,8 +742,42 @@ pub const Loop = struct {
     /// off. The host announces each wait with
     /// `prepareHostWait`, and calls `tick` when the descriptor is readable.
     /// The host must not read from it.
+    ///
+    /// On IOCP it is the completion port, which has no readiness: the host
+    /// learns of an entry by dequeuing it, and posts it back unchanged with
+    /// `PostQueuedCompletionStatus` so the loop still sees it. A `wake`
+    /// reaches the host as an APC, so the host waits alertably from the
+    /// thread it gave `adoptWakeThread`.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
+    }
+
+    /// Makes the calling thread the target of cross-thread wakes, for a
+    /// host whose waiting thread is not the one that initialized the loop.
+    /// Only IOCP wakes a thread. The other backends wake a descriptor, and
+    /// this does nothing there. Call it from one thread at a time.
+    pub fn adoptWakeThread(self: *Loop) void {
+        self.backend.adoptWakeThread();
+    }
+
+    /// The target of cross-thread wakes that `borrowWakeThread` replaced.
+    /// Only IOCP has one, see `adoptWakeThread`.
+    pub const WakeLoan = if (@hasDecl(Backend, "WakeLoan")) Backend.WakeLoan else void;
+
+    /// Makes the calling thread the target of cross-thread wakes until
+    /// `returnWakeThread`, for a call that waits in the loop's own poll on
+    /// a thread the host did not give them to. `Executor.run` does this,
+    /// since a blocking call on a bound thread waits there.
+    pub fn borrowWakeThread(self: *Loop) WakeLoan {
+        if (WakeLoan == void) return {};
+        return self.backend.borrowWakeThread();
+    }
+
+    /// Gives the cross-thread wakes back to the thread `borrowWakeThread`
+    /// took them from.
+    pub fn returnWakeThread(self: *Loop, loan: WakeLoan) void {
+        if (WakeLoan == void) return;
+        self.backend.returnWakeThread(loan);
     }
 
     /// Announces that the host is about to wait on `hostHandle`. Until the

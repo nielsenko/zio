@@ -285,6 +285,10 @@ pub fn Backend(comptime mode: Mode) type {
             };
         }
 
+        pub fn adoptWakeThread(self: *Self) void {
+            _ = self;
+        }
+
         pub fn hasPendingChanges(self: *const Self) bool {
             return switch (mode) {
                 .io_uring => self.engine.io_uring.hasPendingChanges(),

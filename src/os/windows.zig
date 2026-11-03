@@ -362,6 +362,7 @@ pub extern "kernel32" fn DuplicateHandle(
 
 // Thread/process functions
 pub extern "kernel32" fn GetCurrentThread() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
 pub extern "kernel32" fn CancelSynchronousIo(hThread: HANDLE) callconv(.winapi) BOOL;
 

@@ -53,7 +53,9 @@ A tick ends the announcement. A host that ticks while it is already waiting, for
 
 ### Backends Without a Descriptor
 
-`hostHandle()` is null on the poll and IOCP backends. It is also null on io_uring unless zio is built with `-Dio_uring_single_issuer=false`. A ring set up with `DEFER_TASKRUN` holds its completions until its own thread enters the kernel, so a wait elsewhere would not see them.
+`hostHandle()` is null on the poll backend. It is also null on io_uring unless zio is built with `-Dio_uring_single_issuer=false`. A ring set up with `DEFER_TASKRUN` holds its completions until its own thread enters the kernel, so a wait elsewhere would not see them.
+
+On IOCP it is the completion port, which `poll` can't wait on. A host that waits on the port dequeues each entry and posts it back for the loop. It also waits alertably, from the thread it gave `Loop.adoptWakeThread`, because a wake from another thread arrives there as an APC. A tick whose poll waits, and a blocking call on a bound thread such as a task handle's `cancel()`, borrow the wakes while they wait in the loop's own poll and give them back afterwards. `Loop.hostHandle` has the details. The example treats Windows like a backend without a descriptor.
 
 Without a descriptor, the host lets the tick wait in the loop's own poll, with a cap that suits it, as the example does with `tick(.fromMilliseconds(100))`.
 

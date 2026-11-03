@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zio = @import("zio");
 
 pub const std_options_debug_io = zio.debug_io;
@@ -47,8 +48,10 @@ pub fn main(init: std.process.Init) !void {
         if (task.hasResult()) break;
         if (more) continue;
 
-        const fd = loop.hostHandle() orelse {
-            // No descriptor on this backend. Let the loop wait in its poll.
+        // IOCP's handle is a completion port, which poll can't wait on.
+        const handle = if (builtin.os.tag == .windows) null else loop.hostHandle();
+        const fd = handle orelse {
+            // No descriptor to poll. Let the loop wait in its own poll.
             _ = try executor.tick(.fromMilliseconds(100));
             continue;
         };

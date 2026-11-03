@@ -44,6 +44,10 @@ All notable changes to this project will be documented in this file.
   move the executor to another thread outside a tick. A tick from inside one of the
   executor's own tasks returns `error.AlreadyRunning`. See the new Host Event Loop page.
 
+- Added `Loop.adoptWakeThread`, to send IOCP wakes to the thread a host waits on when that
+  is not the thread that ticks. `Loop.borrowWakeThread` and `Loop.returnWakeThread` lend
+  them to another thread for one wait, as a tick that waits does.
+
 - Added `RuntimeOptions.loop_group`, to let runtimes share a caller-owned `LoopGroup`. A
   stream accepted on one runtime can then be read on another, which IOCP needs, since a
   socket stays bound to one completion port. `LoopGroup.allocator` allocates what the

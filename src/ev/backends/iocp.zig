@@ -427,18 +427,28 @@ allocator: std.mem.Allocator,
 shared_state: *SharedState,
 entries: []windows.OVERLAPPED_ENTRY,
 queue_size: u16,
+/// The thread `wake` queues its APC to. `swapWakeTarget` swaps it while
+/// wakers on other threads use it, so both hold `wake_lock`.
 thread_handle: windows.HANDLE,
+wake_lock: os.Mutex = .init(),
+/// The id of the thread behind `thread_handle`. Only the thread that
+/// adopts, borrows or returns the wakes reads it.
+wake_thread_id: windows.DWORD,
 
 // Native real (wall-clock) timer. Windows has no boot clock distinct from the
 // awake clock (both are QPC), so boot timers ride the awake poll timeout and
 // only `.real` is armed natively. This one-shot waitable timer's completion
 // routine sets `real_fired` via an APC delivered during the alertable poll;
 // `real_armed` tracks the armed absolute deadline so syncWallTimer can skip
-// redundant re-arms. Both are touched only on the loop thread (the APC also
-// runs there), so no synchronization is needed.
+// redundant re-arms. Only the thread that polls touches `real_armed`.
 real_timer: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
 real_armed: ?u64 = null,
-real_fired: bool = false,
+/// The thread that armed `real_timer`, which its APC goes to. A host may
+/// poll from another thread later, and `syncWallTimer` arms it again there.
+real_armed_by: windows.DWORD = 0,
+/// Atomic, since an APC queued to a thread that no longer polls can still
+/// run there.
+real_fired: std.atomic.Value(bool) = .init(false),
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     // Acquire reference to shared state (creates IOCP handle if first loop)
@@ -471,6 +481,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
         .entries = entries,
         .queue_size = queue_size,
         .thread_handle = thread_handle,
+        .wake_thread_id = windows.GetCurrentThreadId(),
     };
 
     // Create the per-loop real (wall-clock) waitable timer. Prefer the
@@ -566,15 +577,67 @@ fn wallTimerAPC(arg: ?*anyopaque, low: windows.DWORD, high: windows.DWORD) callc
     _ = low;
     _ = high;
     if (arg) |p| {
-        const fired: *bool = @ptrCast(@alignCast(p));
-        fired.* = true;
+        const fired: *std.atomic.Value(bool) = @ptrCast(@alignCast(p));
+        fired.store(true, .release);
     }
 }
 
 /// See `Loop.hostHandle`.
 pub fn hostHandle(self: *const Self) ?net.fd_t {
-    _ = self;
-    return null;
+    return @ptrCast(self.shared_state.iocp);
+}
+
+/// See `Loop.adoptWakeThread`.
+pub fn adoptWakeThread(self: *Self) void {
+    const previous = self.borrowWakeThread() orelse return;
+    // No waker holds the previous handle now, so a handle value Windows
+    // reuses can't take an APC meant for this loop.
+    _ = windows.CloseHandle(previous.handle);
+}
+
+/// See `Loop.WakeLoan`. Null when the calling thread had the wakes already.
+pub const WakeLoan = ?WakeTarget;
+
+const WakeTarget = struct {
+    handle: windows.HANDLE,
+    thread_id: windows.DWORD,
+};
+
+/// See `Loop.borrowWakeThread`.
+pub fn borrowWakeThread(self: *Self) WakeLoan {
+    const thread_id = windows.GetCurrentThreadId();
+    if (thread_id == self.wake_thread_id) return null;
+
+    var handle: windows.HANDLE = undefined;
+    const ok = windows.DuplicateHandle(
+        windows.GetCurrentProcess(),
+        windows.GetCurrentThread(),
+        windows.GetCurrentProcess(),
+        &handle,
+        0,
+        windows.FALSE,
+        windows.DUPLICATE_SAME_ACCESS,
+    );
+    if (ok == windows.FALSE) return null;
+    return self.swapWakeTarget(.{ .handle = handle, .thread_id = thread_id });
+}
+
+/// See `Loop.returnWakeThread`.
+pub fn returnWakeThread(self: *Self, loan: WakeLoan) void {
+    const previous = loan orelse return;
+    const borrowed = self.swapWakeTarget(previous);
+    // As in `adoptWakeThread`, no waker holds the borrowed handle now.
+    _ = windows.CloseHandle(borrowed.handle);
+}
+
+/// Points the wakes at `target` and returns the target it replaced.
+fn swapWakeTarget(self: *Self, target: WakeTarget) WakeTarget {
+    self.wake_lock.lock();
+    const previous: WakeTarget = .{ .handle = self.thread_handle, .thread_id = self.wake_thread_id };
+    self.thread_handle = target.handle;
+    self.wake_lock.unlock();
+    self.wake_thread_id = target.thread_id;
+    return previous;
 }
 
 pub fn wake(self: *Self, state: *LoopState) void {
@@ -582,8 +645,12 @@ pub fn wake(self: *Self, state: *LoopState) void {
     // Queue an APC to wake the thread. Hot cross-thread path (every cross-thread
     // task schedule), also run from thread-pool workers, so it must not log: a
     // log call takes the stderr lock, which a parked task can hold while it
-    // waits for the very completion this wake delivers (see stderr.zig).
+    // waits for the very completion this wake delivers (see stderr.zig). The
+    // wake lock is safe to take here. Its only other holder is
+    // `adoptWakeThread`, which never blocks inside it.
+    self.wake_lock.lock();
     const result = windows.QueueUserAPC(wakeAPC, self.thread_handle, 0);
+    self.wake_lock.unlock();
     if (result == 0) {
         log.err("QueueUserAPC failed: {}", .{windows.GetLastError()});
     }
@@ -2444,9 +2511,15 @@ const filetime_epoch_diff_ticks: u64 = 11644473600 * (time.ns_per_s / 100);
 /// heap (see `boot_distinct_from_awake`).
 pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
     std.debug.assert(clock == .real);
-    if (self.real_armed == deadline) return true; // unchanged (incl. both null)
+    const thread_id = windows.GetCurrentThreadId();
+    if (self.real_armed == deadline and (deadline == null or self.real_armed_by == thread_id)) return true;
 
     if (deadline) |d| {
+        // Arming again resets the timer, but an APC it already queued to
+        // another thread stays there unless canceled.
+        if (self.real_armed != null and self.real_armed_by != thread_id) {
+            _ = windows.CancelWaitableTimer(self.real_timer);
+        }
         // A positive LARGE_INTEGER due time (100-ns units) is an absolute
         // FILETIME: map the Unix-ns deadline so the kernel re-evaluates it
         // across system-clock steps, matching the .real epoch.
@@ -2458,6 +2531,7 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
             self.real_armed = null;
             return false;
         }
+        self.real_armed_by = thread_id;
     } else {
         // Disarm. A failed cancel leaves the old one-shot armed; its APC would
         // wake one extra poll harmlessly, so we still report success.
@@ -2474,8 +2548,7 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
 /// A fired one-shot is gone, so clear `real_armed` to force a re-arm for the
 /// next deadline on the following scan.
 fn consumeWallFired(self: *Self) bool {
-    if (!self.real_fired) return false;
-    self.real_fired = false;
+    if (!self.real_fired.swap(false, .acquire)) return false;
     self.real_armed = null;
     return true;
 }
