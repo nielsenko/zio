@@ -157,6 +157,11 @@ pub const RuntimeOptions = struct {
     enable_main_executor: bool = true,
     /// DNS resolver configuration.
     dns: DnsOptions = .{},
+    /// Loop group the executors join instead of the runtime's own. Runtimes
+    /// sharing a group share the backend state, which on IOCP is the
+    /// completion port a socket is bound to for life: a stream accepted on one
+    /// runtime can then be read on another. Must outlive every runtime in it.
+    loop_group: ?*ev.LoopGroup = null,
 };
 
 pub const DnsOptions = struct {
@@ -692,7 +697,7 @@ pub const Executor = struct {
         try self.loop.init(.{
             .allocator = self.runtime.allocator,
             .thread_pool = &self.runtime.thread_pool,
-            .loop_group = &self.runtime.loop_group,
+            .loop_group = self.runtime.options.loop_group orelse &self.runtime.loop_group,
         });
         errdefer self.loop.deinit();
 
@@ -3616,6 +3621,65 @@ test "runtime: disable main executor" {
     var handle = try runtime.spawn(compute, .{21});
     const result = handle.join();
     try std.testing.expectEqual(42, result);
+}
+
+test "runtime: a stream accepted on one runtime is read on another in the same loop group" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const net = @import("net.zig");
+    var group: ev.LoopGroup = .{};
+    const acceptor = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer acceptor.deinit();
+    const reader = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer reader.deinit();
+
+    const Acceptor = struct {
+        fn run(port: *std.atomic.Value(u16), bound: *os.ResetEvent) !net.Stream {
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            port.store(server.socket.address.ip.getPort(), .release);
+            bound.set();
+            return server.accept(.{});
+        }
+    };
+    const Client = struct {
+        fn run(port: u16) !void {
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try net.tcpConnectToAddress(addr, .{});
+            defer stream.close();
+            var write_buffer: [16]u8 = undefined;
+            var writer = stream.writer(&write_buffer);
+            try writer.interface.writeAll("hello\n");
+            try writer.interface.flush();
+        }
+    };
+    const Reader = struct {
+        fn run(stream: net.Stream) !bool {
+            defer stream.close();
+            var read_buffer: [16]u8 = undefined;
+            var r = stream.reader(&read_buffer);
+            const line = try r.interface.takeDelimiterExclusive('\n');
+            return std.mem.eql(u8, "hello", line);
+        }
+    };
+
+    var port = std.atomic.Value(u16).init(0);
+    var bound: os.ResetEvent = .init();
+    var accepting = try acceptor.spawn(Acceptor.run, .{ &port, &bound });
+    bound.wait();
+    var client = try reader.spawn(Client.run, .{port.load(.acquire)});
+    const stream = try accepting.join();
+    try client.join();
+
+    var reading = try reader.spawn(Reader.run, .{stream});
+    try std.testing.expect(try reading.join());
 }
 
 test "runtime: installs a SIGPIPE handler while the disposition is default" {
