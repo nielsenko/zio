@@ -25,6 +25,7 @@ const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const time = @import("../os/time.zig");
 const net = @import("../os/net.zig");
 const common = @import("backends/common.zig");
+const sockreg = @import("sockreg.zig");
 
 const log = @import("../common.zig").log;
 
@@ -138,6 +139,10 @@ pub const LoopGroup = struct {
     shared: Backend.SharedState = .{},
     /// Loops initialized with this group and not yet deinitialized.
     loops: std.atomic.Value(u32) = .init(0),
+    /// Allocates what the group's loops share, such as the socket table of
+    /// the kqueue and epoll backends. The loop that joins first may leave
+    /// before the others, so the group owns it, not a loop.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 fn timerDeadlineLess(_: void, a: *Timer, b: *Timer) bool {
@@ -559,6 +564,7 @@ pub const Loop = struct {
         if (options.loop_group) |group| {
             self.loop_group = group;
         } else {
+            self.internal_loop_group.allocator = options.allocator;
             self.loop_group = &self.internal_loop_group;
         }
 
@@ -575,6 +581,9 @@ pub const Loop = struct {
             @panic("zio: .single_executor scheduling allows only one loop per LoopGroup");
         }
         errdefer _ = self.loop_group.loops.fetchSub(1, .monotonic);
+
+        if (has_sock_table) Backend.sockTable(&self.loop_group.shared).acquire(self.loop_group.allocator);
+        errdefer if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
 
         try self.backend.init(
             options.allocator,
@@ -598,9 +607,16 @@ pub const Loop = struct {
         while (c) |completion| : (c = completion.next) {
             disarmAsync(completion.cast(Async));
         }
+        if (has_sock_table) sockreg.leave(Backend.sockTable(&self.loop_group.shared), self, Backend.registerSocketOn);
         self.backend.deinit();
+        if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
         _ = self.loop_group.loops.fetchSub(1, .monotonic);
     }
+
+    /// Whether the backend keeps a socket table that the loops of a group
+    /// share, see sockreg.zig. A loop acquires it with the group's
+    /// allocator.
+    const has_sock_table = @hasDecl(Backend, "sockTable");
 
     /// Debug-only: assert we're on the thread that owns this loop.
     inline fn assertOwnThread(self: *const Loop) void {
@@ -1591,4 +1607,28 @@ pub const Loop = struct {
 
 test {
     _ = @import("tests.zig");
+}
+
+test "LoopGroup: loops join and leave a group from two threads at once" {
+    if (builtin.single_threaded or single_owner) return error.SkipZigTest;
+
+    const Churn = struct {
+        fn run(group: *LoopGroup, failures: *std.atomic.Value(u32)) void {
+            for (0..500) |_| {
+                var loop: Loop = undefined;
+                loop.init(.{ .loop_group = group }) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                loop.deinit();
+            }
+        }
+    };
+    var group: LoopGroup = .{};
+    var failures = std.atomic.Value(u32).init(0);
+    const a = try std.Thread.spawn(.{}, Churn.run, .{ &group, &failures });
+    const b = try std.Thread.spawn(.{}, Churn.run, .{ &group, &failures });
+    a.join();
+    b.join();
+    try std.testing.expectEqual(0, failures.load(.monotonic));
 }

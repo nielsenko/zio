@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `RuntimeOptions.loop_group`, to let runtimes share a caller-owned `LoopGroup`. A
+  stream accepted on one runtime can then be read on another, which IOCP needs, since a
+  socket stays bound to one completion port. `LoopGroup.allocator` allocates what the
+  group's loops share, and a runtime may leave the group before the others.
+
 ### Fixed
 
 - `setsockopt` failing with `EINVAL`, such as `TCP_NODELAY` on an already shut down
