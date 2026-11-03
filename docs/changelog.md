@@ -20,6 +20,11 @@ All notable changes to this project will be documented in this file.
   the driver, for example to have it cancel one of its operations, without parking an
   `ev.Async` in the queue. Added the `zio.Interruptible` error set.
 
+- Added `RuntimeOptions.loop_group`, to let runtimes share a caller-owned `LoopGroup`. A
+  stream accepted on one runtime can then be read on another, which IOCP needs, since a
+  socket stays bound to one completion port. `LoopGroup.allocator` allocates what the
+  group's loops share, and a runtime may leave the group before the others.
+
 ### Changed
 
 - Tasks woken by I/O completions are scheduled as each completion is processed again,
