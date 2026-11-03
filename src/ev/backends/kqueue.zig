@@ -9,6 +9,7 @@ const common = @import("common.zig");
 
 const unexpectedError = @import("../../os/base.zig").unexpectedError;
 const LoopState = @import("../loop.zig").LoopState;
+const Loop = @import("../loop.zig").Loop;
 const Completion = @import("../completion.zig").Completion;
 const Queue = @import("../queue.zig").Queue;
 const NetConnect = @import("../completion.zig").NetConnect;
@@ -247,8 +248,6 @@ fn makeKey(ident: usize, filter: i32) u64 {
 }
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
-    shared_state.sock_table.acquire(allocator);
-    errdefer shared_state.sock_table.release();
     const kq = std.c.kqueue();
     const kqueue_fd: i32 = switch (posix.errno(kq)) {
         .SUCCESS => @intCast(kq),
@@ -299,7 +298,11 @@ pub fn deinit(self: *Self) void {
     if (self.kqueue_fd != -1) {
         _ = std.c.close(self.kqueue_fd);
     }
-    self.shared.sock_table.release();
+}
+
+/// See `Loop.has_sock_table`.
+pub fn sockTable(shared_state: *SharedState) *sockreg.Table {
+    return &shared_state.sock_table;
 }
 
 /// See `Loop.hostHandle`.
@@ -549,6 +552,29 @@ fn ensureKevent(self: *Self, fd: NetHandle, dir: sockreg.Dir) bool {
         .udata = sock_marker,
     };
     return true;
+}
+
+/// Arm `loop`'s kqueue for `(fd, dir)` from a thread other than its own, for
+/// `sockreg.leave`. The change goes to the kernel at once rather than to the
+/// loop's change buffer, which only its own thread touches. A loop blocked
+/// in `kevent` wakes when the socket is ready.
+pub fn registerSocketOn(loop: *Loop, fd: NetHandle, dir: sockreg.Dir, other_owned_here: bool) bool {
+    _ = other_owned_here;
+    const change: [1]std.c.Kevent = .{.{
+        .ident = @intCast(fd),
+        .filter = filterForDir(dir),
+        .flags = std.c.EV.ADD | std.c.EV.CLEAR,
+        .fflags = 0,
+        .data = 0,
+        .udata = sock_marker,
+    }};
+    return switch (posix.errno(std.c.kevent(loop.backend.kqueue_fd, &change, 1, &.{}, 0, null))) {
+        .SUCCESS => true,
+        else => |err| blk: {
+            log.err("kqueue: failed to register socket on another loop: {}", .{err});
+            break :blk false;
+        },
+    };
 }
 
 /// Arm this loop's kqueue for `(fd, dir)`. kqueue tracks read/write as separate

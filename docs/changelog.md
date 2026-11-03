@@ -44,6 +44,11 @@ All notable changes to this project will be documented in this file.
   move the executor to another thread outside a tick. A tick from inside one of the
   executor's own tasks returns `error.AlreadyRunning`. See the new Host Event Loop page.
 
+- Added `RuntimeOptions.loop_group`, to let runtimes share a caller-owned `LoopGroup`. A
+  stream accepted on one runtime can then be read on another, which IOCP needs, since a
+  socket stays bound to one completion port. `LoopGroup.allocator` allocates what the
+  group's loops share, and a runtime may leave the group before the others.
+
 - Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
   `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
   `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.

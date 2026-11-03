@@ -210,8 +210,6 @@ pending_changes: usize = 0,
 epoll_pwait2_supported: bool = true,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
-    shared_state.sock_table.acquire(allocator);
-    errdefer shared_state.sock_table.release();
     const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
     const epoll_fd: i32 = switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -287,7 +285,6 @@ pub fn deinit(self: *Self) void {
     if (self.epoll_fd != -1) {
         _ = std.os.linux.close(self.epoll_fd);
     }
-    self.shared.sock_table.release();
 }
 
 /// See `Loop.hostHandle`.

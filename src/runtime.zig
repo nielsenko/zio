@@ -161,6 +161,13 @@ pub const RuntimeOptions = struct {
     enable_main_executor: bool = true,
     /// DNS resolver configuration.
     dns: DnsOptions = .{},
+    /// Loop group the executors join instead of the runtime's own. Runtimes
+    /// sharing a group share the backend state, which on IOCP is the
+    /// completion port a socket is bound to for life: a stream accepted on one
+    /// runtime can then be read on another. Must outlive every runtime in it.
+    /// Under `.single_executor` scheduling a group holds one loop, so only
+    /// one runtime can join it.
+    loop_group: ?*ev.LoopGroup = null,
 };
 
 pub const DnsOptions = struct {
@@ -708,7 +715,7 @@ pub const Executor = struct {
         try self.loop.init(.{
             .allocator = self.runtime.allocator,
             .thread_pool = &self.runtime.thread_pool,
-            .loop_group = &self.runtime.loop_group,
+            .loop_group = self.runtime.options.loop_group orelse &self.runtime.loop_group,
         });
         errdefer self.loop.deinit();
 
@@ -1506,15 +1513,27 @@ pub const Executor = struct {
     /// executor, and wake that executor's loop. Goes to the home executor's
     /// overflow queue: the shared one (migration on, any executor may run it) or
     /// the home executor's own (migration off, stays home).
-    /// Safe builds: count a wake from a thread that is not an executor of the
-    /// task's runtime, so `Runtime.deinit` can report one still in progress.
+    /// Safe builds: count a wake from a thread that is not an executor, so
+    /// `Runtime.deinit` can report one still in progress. An executor of
+    /// another runtime counts as external, see `beginCrossRuntimeWake`.
     fn beginForeignWakeCheck(task: *AnyTask) ?*Runtime {
+        if (getCurrentExecutorOrNull() != null) return null;
         const rt = task.runtime;
-        if (getCurrentExecutorOrNull()) |exec| {
-            if (exec.runtime == rt) return null;
-        }
         _ = rt.foreign_wakes.fetchAdd(1, .monotonic);
         return rt;
+    }
+
+    /// The task's runtime, when an executor of another runtime wakes the
+    /// task. Runtimes in one loop group service each other's sockets, so
+    /// the wake can come from a loop thread of the other runtime, which the
+    /// program has no way to stop before `Runtime.deinit`. The wake holds
+    /// the external-wake count of the task's runtime, which `deinit` waits
+    /// for.
+    fn beginCrossRuntimeWake(task: *AnyTask) ?*Runtime {
+        const exec = getCurrentExecutorOrNull() orelse return null;
+        if (exec.runtime == task.runtime) return null;
+        task.runtime.beginExternalWake();
+        return task.runtime;
     }
 
     fn endForeignWakeCheck(rt: ?*Runtime) void {
@@ -1523,6 +1542,11 @@ pub const Executor = struct {
 
     fn scheduleTaskRemote(self: *Executor, task: *AnyTask) void {
         std.debug.assert(task != &self.main_task);
+        if (std.debug.runtime_safety) {
+            if (getCurrentExecutorOrNull()) |exec| {
+                std.debug.assert(exec.runtime == self.runtime or self.runtime.external_wakes.load(.monotonic) > 0);
+            }
+        }
 
         self.run_queue.overflow.push(&task.awaitable.wait_node);
         self.loop.wake();
@@ -1546,6 +1570,8 @@ pub const Executor = struct {
     ///
     /// May migrate the task to the current executor for cache locality.
     pub fn scheduleTask(task: *AnyTask, comptime kind: AnyTask.WakeKind) void {
+        const cross_rt = beginCrossRuntimeWake(task);
+        defer if (cross_rt) |rt| rt.endExternalWake();
         const foreign_rt = if (compat.is_safe) beginForeignWakeCheck(task) else {};
         defer if (compat.is_safe) endForeignWakeCheck(foreign_rt);
 
@@ -2083,6 +2109,7 @@ pub const Runtime = struct {
             .stack_pool = .init(options.stack_pool),
             .task_pool = .init(allocator),
             .resolver = if (options.dns.custom_resolver) dns.Resolver.init(allocator) else null,
+            .loop_group = .{ .allocator = allocator },
         };
         errdefer if (self.resolver) |*r| r.deinit();
 
@@ -2278,7 +2305,8 @@ pub const Runtime = struct {
     /// every thread outside the runtime that wakes its tasks (by setting an
     /// `Event`, sending on a channel, and so on) must have stopped doing so:
     /// a wake still in progress can touch an executor after it is freed.
-    /// Safe builds panic when they catch either.
+    /// Safe builds panic when they catch either. A wake from an executor of
+    /// another runtime in the loop group is one zio waits for.
     pub fn deinit(self: *Runtime) void {
         const allocator = self.allocator;
 
@@ -4294,6 +4322,238 @@ test "runtime: disable main executor" {
     var handle = try runtime.spawn(compute, .{21});
     const result = handle.join();
     try std.testing.expectEqual(42, result);
+}
+
+test "runtime: a stream accepted on one runtime is read on another in the same loop group" {
+    if (!multi_executor) return error.SkipZigTest;
+
+    const net = @import("net.zig");
+    var group: ev.LoopGroup = .{};
+    const acceptor = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer acceptor.deinit();
+    const reader = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer reader.deinit();
+
+    const Acceptor = struct {
+        fn run(port: *std.atomic.Value(u16), bound: *os.ResetEvent) !net.Stream {
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            port.store(server.socket.address.ip.getPort(), .release);
+            bound.set();
+            return server.accept(.{});
+        }
+    };
+    const Client = struct {
+        fn run(port: u16) !void {
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try net.tcpConnectToAddress(addr, .{});
+            defer stream.close();
+            var write_buffer: [16]u8 = undefined;
+            var writer = stream.writer(&write_buffer);
+            try writer.interface.writeAll("hello\n");
+            try writer.interface.flush();
+        }
+    };
+    const Reader = struct {
+        fn run(stream: net.Stream) !bool {
+            defer stream.close();
+            var read_buffer: [16]u8 = undefined;
+            var r = stream.reader(&read_buffer);
+            const line = try r.interface.takeDelimiterExclusive('\n');
+            return std.mem.eql(u8, "hello", line);
+        }
+    };
+
+    var port = std.atomic.Value(u16).init(0);
+    var bound: os.ResetEvent = .init();
+    var accepting = try acceptor.spawn(Acceptor.run, .{ &port, &bound });
+    bound.wait();
+    var client = try reader.spawn(Client.run, .{port.load(.acquire)});
+    const stream = try accepting.join();
+    try client.join();
+
+    var reading = try reader.spawn(Reader.run, .{stream});
+    try std.testing.expect(try reading.join());
+}
+
+test "runtime: the first runtime of a loop group leaves no memory behind in the group" {
+    if (!multi_executor) return error.SkipZigTest;
+
+    const net = @import("net.zig");
+    var group: ev.LoopGroup = .{ .allocator = std.testing.allocator };
+    var first_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = first_allocator.deinit();
+    const first = try Runtime.init(first_allocator.allocator(), .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    const second = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer second.deinit();
+
+    const Acceptor = struct {
+        fn run(port: *std.atomic.Value(u16), bound: *os.ResetEvent) !void {
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            port.store(server.socket.address.ip.getPort(), .release);
+            bound.set();
+            const stream = try server.accept(.{});
+            stream.close();
+        }
+    };
+    const Client = struct {
+        fn run(port: u16) !void {
+            // Late, so the accept waits on the socket table.
+            try sleep(.fromMilliseconds(50));
+            const addr = try net.IpAddress.parseIp4("127.0.0.1", port);
+            const stream = try net.tcpConnectToAddress(addr, .{});
+            stream.close();
+        }
+    };
+    var port = std.atomic.Value(u16).init(0);
+    var bound: os.ResetEvent = .init();
+    var accepting = try second.spawn(Acceptor.run, .{ &port, &bound });
+    bound.wait();
+    var client = try second.spawn(Client.run, .{port.load(.acquire)});
+    try accepting.join();
+    try client.join();
+
+    first.deinit();
+    try std.testing.expectEqual(0, first_allocator.detectLeaks());
+}
+
+/// Waits until a task parks a read on `fd` in the loop group's socket table.
+fn waitForSocketReader(group: *ev.LoopGroup, fd: os.net.fd_t) !void {
+    const table = ev.Backend.sockTable(&group.shared);
+    const shard = table.shardForFd(fd);
+    const start = Timestamp.now(.monotonic);
+    while (start.untilNow(.monotonic).toMilliseconds() < 2000) {
+        {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            if (shard.map.getPtr(@bitCast(fd))) |entry| {
+                if (entry.read_waiters.head != null) return;
+            }
+        }
+        os.time.sleep(.fromMilliseconds(1));
+    }
+    return error.Timeout;
+}
+
+test "runtime: sockets of a loop group keep working after the runtime whose loop watched them leaves" {
+    if (!multi_executor) return error.SkipZigTest;
+    // The kqueue and epoll backends share a socket table, io_uring does not.
+    if (comptime !@hasDecl(ev.Backend, "sockTable")) return error.SkipZigTest;
+    if (builtin.os.tag == .linux and zio_options.backend != .epoll) return error.SkipZigTest;
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const watched = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(watched[0]);
+    defer os_net.close(watched[1]);
+    const later = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(later[0]);
+    defer os_net.close(later[1]);
+
+    var group: ev.LoopGroup = .{ .allocator = std.testing.allocator };
+    const first = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    var first_left = false;
+    defer if (!first_left) first.deinit();
+    const second = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer second.deinit();
+
+    const Reader = struct {
+        fn run(fd: os_net.fd_t) !void {
+            var buf: [1]u8 = undefined;
+            var iov: [1]os.iovec = undefined;
+            _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .fromMilliseconds(5000));
+        }
+    };
+    const byte = [_]os.iovec_const{os.iovecConstFromSlice("x")};
+
+    // A read that waits makes the loop it waits on the socket's owner.
+    for ([_][2]os_net.fd_t{ watched, later }) |pair| {
+        var reading = try first.spawn(Reader.run, .{pair[0]});
+        try waitForSocketReader(&group, pair[0]);
+        _ = try os_net.send(pair[1], &byte, .{});
+        try reading.join();
+    }
+
+    var waiting = try second.spawn(Reader.run, .{watched[0]});
+    try waitForSocketReader(&group, watched[0]);
+    first.deinit();
+    first_left = true;
+    _ = try os_net.send(watched[1], &byte, .{});
+    try waiting.join();
+
+    var reading = try second.spawn(Reader.run, .{later[0]});
+    try waitForSocketReader(&group, later[0]);
+    _ = try os_net.send(later[1], &byte, .{});
+    try reading.join();
+}
+
+test "runtime: a runtime shuts down right after another runtime's loop wakes its task" {
+    if (!multi_executor) return error.SkipZigTest;
+    if (comptime !@hasDecl(ev.Backend, "sockTable")) return error.SkipZigTest;
+    if (builtin.os.tag == .linux and zio_options.backend != .epoll) return error.SkipZigTest;
+
+    const net = @import("net.zig");
+    const os_net = @import("os/net.zig");
+    const pair = try os_net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer os_net.close(pair[0]);
+    defer os_net.close(pair[1]);
+
+    var group: ev.LoopGroup = .{ .allocator = std.testing.allocator };
+    const owner = try Runtime.init(std.testing.allocator, .{
+        .enable_main_executor = false,
+        .loop_group = &group,
+    });
+    defer owner.deinit();
+
+    const Reader = struct {
+        /// Untimed, so the loop that services the read wakes the task. A
+        /// timed one finishes on the loop of its timer.
+        fn run(fd: os_net.fd_t) !void {
+            var buf: [1]u8 = undefined;
+            var iov: [1]os.iovec = undefined;
+            _ = try net.readBuf(fd, .fromSlice(&buf, &iov), .none);
+        }
+    };
+    const byte = [_]os.iovec_const{os.iovecConstFromSlice("x")};
+
+    // The owner's loop waits on the socket first, and keeps it.
+    var owning = try owner.spawn(Reader.run, .{pair[0]});
+    try waitForSocketReader(&group, pair[0]);
+    _ = try os_net.send(pair[1], &byte, .{});
+    try owning.join();
+
+    for (0..5) |_| {
+        const woken = try Runtime.init(std.testing.allocator, .{
+            .enable_main_executor = false,
+            .loop_group = &group,
+        });
+        var reading = try woken.spawn(Reader.run, .{pair[0]});
+        try waitForSocketReader(&group, pair[0]);
+        _ = try os_net.send(pair[1], &byte, .{});
+        try reading.join();
+        woken.deinit();
+    }
 }
 
 test "runtime: installs a SIGPIPE handler while the disposition is default" {

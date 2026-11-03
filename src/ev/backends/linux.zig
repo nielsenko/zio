@@ -7,9 +7,11 @@ const Op = @import("../completion.zig").Op;
 const Support = @import("../completion.zig").Support;
 const WallTimerMode = @import("../completion.zig").WallTimerMode;
 const LoopState = @import("../loop.zig").LoopState;
+const Loop = @import("../loop.zig").Loop;
 const Duration = @import("../../time.zig").Duration;
 const Clock = @import("../../time.zig").Clock;
 const os = @import("../../os/root.zig");
+const sockreg = @import("../sockreg.zig");
 
 /// Compile-time Linux backend policy. `auto` prefers io_uring and falls back to
 /// epoll only when ring setup itself is unavailable; explicit engine selections
@@ -90,6 +92,7 @@ pub fn Backend(comptime mode: Mode) type {
             io_uring: IoUring,
             epoll: Epoll,
         },
+        shared_state: *SharedState,
 
         pub fn capability(comptime op: Op) Support {
             return switch (mode) {
@@ -118,7 +121,7 @@ pub fn Backend(comptime mode: Mode) type {
         ) !void {
             var engine: IoUring = undefined;
             try engine.init(allocator, queue_size, &shared_state.io_uring);
-            self.* = .{ .engine = .{ .io_uring = engine } };
+            self.* = .{ .engine = .{ .io_uring = engine }, .shared_state = shared_state };
             shared_state.selection = .io_uring;
         }
 
@@ -130,7 +133,7 @@ pub fn Backend(comptime mode: Mode) type {
         ) !void {
             var engine: Epoll = undefined;
             try engine.init(allocator, queue_size, &shared_state.epoll);
-            self.* = .{ .engine = .{ .epoll = engine } };
+            self.* = .{ .engine = .{ .epoll = engine }, .shared_state = shared_state };
             shared_state.selection = .epoll;
         }
 
@@ -168,7 +171,27 @@ pub fn Backend(comptime mode: Mode) type {
             }
         }
 
+        /// See `Loop.has_sock_table`. Only the epoll engine uses it, and an
+        /// io_uring group keeps it empty.
+        pub fn sockTable(shared_state: *SharedState) *sockreg.Table {
+            return &shared_state.epoll.sock_table;
+        }
+
+        /// See `sockreg.leave`. epoll arms a socket with a plain
+        /// `epoll_ctl`, which any thread may call.
+        pub fn registerSocketOn(loop: *Loop, fd: os.net.fd_t, dir: sockreg.Dir, other_owned_here: bool) bool {
+            return switch (loop.backend.engine) {
+                .epoll => |*engine| engine.registerSocket(fd, dir, other_owned_here),
+                // An io_uring group keeps its socket table empty.
+                .io_uring => unreachable,
+            };
+        }
+
         pub fn deinit(self: *Self) void {
+            // The last io_uring loop of the group closes the master ring,
+            // which `init` attaches new rings to under this lock.
+            self.shared_state.selection_mutex.lock();
+            defer self.shared_state.selection_mutex.unlock();
             switch (mode) {
                 .io_uring => self.engine.io_uring.deinit(),
                 .epoll => self.engine.epoll.deinit(),
