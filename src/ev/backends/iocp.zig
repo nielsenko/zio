@@ -573,8 +573,24 @@ fn wallTimerAPC(arg: ?*anyopaque, low: windows.DWORD, high: windows.DWORD) callc
 
 /// See `Loop.hostHandle`.
 pub fn hostHandle(self: *const Self) ?net.fd_t {
-    _ = self;
-    return null;
+    return @ptrCast(self.shared_state.iocp);
+}
+
+/// See `Loop.adoptWakeThread`.
+pub fn adoptWakeThread(self: *Self) void {
+    var handle: windows.HANDLE = undefined;
+    const ok = windows.DuplicateHandle(
+        windows.GetCurrentProcess(),
+        windows.GetCurrentThread(),
+        windows.GetCurrentProcess(),
+        &handle,
+        0,
+        windows.FALSE,
+        windows.DUPLICATE_SAME_ACCESS,
+    );
+    if (ok == windows.FALSE) return;
+    _ = windows.CloseHandle(self.thread_handle);
+    self.thread_handle = handle;
 }
 
 pub fn wake(self: *Self, state: *LoopState) void {

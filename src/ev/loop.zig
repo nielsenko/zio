@@ -696,8 +696,21 @@ pub const Loop = struct {
     /// off. The host announces each wait with
     /// `prepareHostWait`, and calls `tick` when the descriptor is readable.
     /// The host must not read from it.
+    ///
+    /// On IOCP it is the completion port, which has no readiness: the host
+    /// learns of an entry by dequeuing it, and posts it back unchanged with
+    /// `PostQueuedCompletionStatus` so the loop still sees it. A `wake`
+    /// reaches the host as an APC, so the host waits alertably from the
+    /// thread it gave `adoptWakeThread`.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
+    }
+
+    /// Makes the calling thread the target of cross-thread wakes, for a
+    /// host whose waiting thread is not the one that initialized the loop.
+    /// Only IOCP wakes a thread; the other backends wake a descriptor.
+    pub fn adoptWakeThread(self: *Loop) void {
+        self.backend.adoptWakeThread();
     }
 
     /// Announces that the host is about to wait on `hostHandle`. Until the
