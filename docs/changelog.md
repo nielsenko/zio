@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `ip6_only` to `IpAddress.ListenOptions` and `IpAddress.BindOptions`, to set
+  `IPV6_V6ONLY` on an IPv6 socket. Off, the socket also takes IPv4 peers, which Windows
+  refuses by default. OpenBSD can't turn it off, and fails with
+  `error.OptionNotSupported`.
+
 ### Fixed
 
 - `setsockopt` failing with `EINVAL`, such as `TCP_NODELAY` on an already shut down
