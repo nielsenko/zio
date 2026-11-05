@@ -637,6 +637,8 @@ pub const IpAddress = extern union {
 
     pub const ListenOptions = struct {
         kernel_backlog: u31 = default_kernel_backlog,
+        /// SO_REUSEADDR, or SO_EXCLUSIVEADDRUSE on Windows, where SO_REUSEADDR
+        /// lets another socket bind the port while this one listens.
         reuse_address: bool = false,
         reuse_port: bool = false,
         /// IPV6_V6ONLY on an IPv6 listener. Off, it also takes IPv4 clients,
@@ -686,7 +688,11 @@ pub const IpAddress = extern union {
         errdefer socket.close();
 
         if (options.reuse_address) {
-            try socket.setReuseAddress(true);
+            if (builtin.os.tag == .windows) {
+                try socket.setExclusiveAddressUse(true);
+            } else {
+                try socket.setReuseAddress(true);
+            }
         }
         if (options.reuse_port) {
             try socket.setReusePort(true);
@@ -974,6 +980,16 @@ pub const Socket = struct {
     /// Allows binding to an address in TIME_WAIT state
     pub fn setReuseAddress(self: Socket, enabled: bool) !void {
         try self.setBoolOption(os.posix.SOL.SOCKET, os.posix.SO.REUSEADDR, enabled);
+    }
+
+    /// Enable or disable exclusive address use (SO_EXCLUSIVEADDRUSE)
+    /// Refuses every other bind of the address, which SO_REUSEADDR permits on Windows
+    /// Note: Windows only
+    pub fn setExclusiveAddressUse(self: Socket, enabled: bool) !void {
+        if (builtin.os.tag != .windows) {
+            return error.Unsupported;
+        }
+        try self.setBoolOption(os.posix.SOL.SOCKET, @bitCast(os.windows.SO.EXCLUSIVEADDRUSE), enabled);
     }
 
     /// Enable or disable port reuse (SO_REUSEPORT)
@@ -2881,7 +2897,7 @@ test "IpAddress: connect rejects a local_address of another family" {
 }
 
 test "IpAddress: reuse_address does not enable duplicate listeners" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return error.SkipZigTest;
 
     const first_addr = try IpAddress.parseIp4("127.0.0.1", 0);
     const first = try first_addr.listen(.{});

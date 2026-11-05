@@ -77,6 +77,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A listener with `reuse_address` on Windows set `SO_REUSEADDR`, which let any other
+  socket bind its port while it listened. It now sets `SO_EXCLUSIVEADDRUSE`, also
+  reachable as `Socket.setExclusiveAddressUse`.
+
 - On macOS, an executor thread kept its alternate signal stack installed after the
   runtime freed it, because macOS refused the disable call.
 

@@ -2227,10 +2227,16 @@ fn netListenIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io
     errdefer socket.close();
 
     if (options.reuse_address) {
-        socket.setReuseAddress(true) catch return error.OptionUnsupported;
-        // Preserve std.Io's existing behavior: reuse_address also enables
-        // SO_REUSEPORT where the platform supports it, best-effort.
-        socket.setReusePort(true) catch {};
+        if (builtin.os.tag == .windows) {
+            // std.Io documents SO_REUSEADDR here, but on Windows that lets
+            // any other process bind the port while this socket listens.
+            socket.setExclusiveAddressUse(true) catch return error.OptionUnsupported;
+        } else {
+            socket.setReuseAddress(true) catch return error.OptionUnsupported;
+            // Preserve std.Io's existing behavior: reuse_address also enables
+            // SO_REUSEPORT where the platform supports it, best-effort.
+            socket.setReusePort(true) catch {};
+        }
     }
 
     socket.bind(.{ .ip = zio_addr }) catch |err| return bindErrToListenErr(err);
