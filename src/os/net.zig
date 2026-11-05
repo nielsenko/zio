@@ -796,6 +796,16 @@ pub fn setNoDelay(fd: fd_t, enabled: bool) SetsockoptError!void {
     return setsockopt(fd, IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&value));
 }
 
+/// Sets IPV6_V6ONLY on an IPv6 socket. Off, the socket also takes IPv4
+/// peers, which it sees as IPv4-mapped addresses.
+pub fn setIp6Only(fd: fd_t, enabled: bool) SetsockoptError!void {
+    // OpenBSD has no IPv4-mapped addresses. It keeps the option on and
+    // answers an attempt to clear it with EINVAL.
+    if (builtin.os.tag == .openbsd and !enabled) return error.OptionNotSupported;
+    const value: c_int = @intFromBool(enabled);
+    return setsockopt(fd, IPPROTO.IPV6, posix.IPV6.V6ONLY, std.mem.asBytes(&value));
+}
+
 pub const GetsockoptError = error{Unexpected};
 
 pub fn getsockopt(fd: fd_t, level: i32, optname: u32, optval: []u8) GetsockoptError!void {

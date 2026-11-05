@@ -639,11 +639,18 @@ pub const IpAddress = extern union {
         kernel_backlog: u31 = default_kernel_backlog,
         reuse_address: bool = false,
         reuse_port: bool = false,
+        /// IPV6_V6ONLY on an IPv6 listener. Off, it also takes IPv4 clients,
+        /// as IPv4-mapped addresses. Null keeps the system default, which is
+        /// off on Linux and macOS, and on for Windows and the BSDs. OpenBSD
+        /// can't turn it off, and fails with `error.OptionNotSupported`.
+        ip6_only: ?bool = null,
     };
 
     pub const BindOptions = struct {
         reuse_address: bool = false,
         reuse_port: bool = false,
+        /// IPV6_V6ONLY on an IPv6 socket, see `ListenOptions.ip6_only`.
+        ip6_only: ?bool = null,
     };
 
     pub const ConnectOptions = struct {
@@ -664,6 +671,10 @@ pub const IpAddress = extern union {
         if (options.reuse_port) {
             try socket.setReusePort(true);
         }
+        if (options.ip6_only) |ip6_only| {
+            if (self.any.family != os.net.AF.INET6) return error.AddressFamilyUnsupported;
+            try socket.setIp6Only(ip6_only);
+        }
 
         try socket.bind(.{ .ip = self });
 
@@ -679,6 +690,10 @@ pub const IpAddress = extern union {
         }
         if (options.reuse_port) {
             try socket.setReusePort(true);
+        }
+        if (options.ip6_only) |ip6_only| {
+            if (self.any.family != os.net.AF.INET6) return error.AddressFamilyUnsupported;
+            try socket.setIp6Only(ip6_only);
         }
 
         try socket.bind(.{ .ip = self });
@@ -990,6 +1005,11 @@ pub const Socket = struct {
     /// it can fail on a connection the peer has already reset.
     pub fn setNoDelay(self: Socket, enabled: bool) !void {
         try os.net.setNoDelay(self.handle, enabled);
+    }
+
+    /// Sets IPV6_V6ONLY, see `IpAddress.ListenOptions.ip6_only`.
+    pub fn setIp6Only(self: Socket, enabled: bool) !void {
+        try os.net.setIp6Only(self.handle, enabled);
     }
 
     /// Whether Nagle's algorithm is disabled (TCP_NODELAY)
@@ -2687,6 +2707,72 @@ test "IpAddress: listen/accept/connect/read/write IPv4" {
     var write_buffer: [32]u8 = undefined;
     const addr = try IpAddress.parseIp4("127.0.0.1", 0);
     try checkListen(addr, IpAddress.ListenOptions{}, &write_buffer);
+}
+
+/// A listener on the IPv6 wildcard with `ip6_only` set, or a skip on a
+/// host without IPv6 or, for `ip6_only` off, without IPv4-mapped addresses.
+fn listenAny6(ip6_only: bool) !Server {
+    const addr = try IpAddress.parseIp6("::", 0);
+    return addr.listen(.{ .ip6_only = ip6_only }) catch |err| switch (err) {
+        error.AddressFamilyUnsupported, error.AddressUnavailable, error.OptionNotSupported => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+test "IpAddress: ip6_only sets IPV6_V6ONLY on the listener" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    for ([_]bool{ true, false }) |ip6_only| {
+        const server = try listenAny6(ip6_only);
+        defer server.close();
+
+        // Zeroed first: Windows writes this option as a one-byte BOOLEAN.
+        var value: c_int = 0;
+        try os.net.getsockopt(server.socket.handle, os.posix.IPPROTO.IPV6, os.posix.IPV6.V6ONLY, std.mem.asBytes(&value));
+        try std.testing.expectEqual(ip6_only, value != 0);
+    }
+
+    const addr4 = try IpAddress.parseIp4("127.0.0.1", 0);
+    try std.testing.expectError(error.AddressFamilyUnsupported, addr4.listen(.{ .ip6_only = false }));
+}
+
+test "IpAddress: an IPv6 listener with ip6_only off takes an IPv4 client" {
+    const Test = struct {
+        fn serverFn(server: Server) !void {
+            const client = try server.accept(.{});
+            defer client.close();
+
+            var buf: [32]u8 = undefined;
+            var reader = client.reader(&buf);
+            try std.testing.expectEqualStrings("hello", try reader.interface.takeDelimiterExclusive('\n'));
+        }
+
+        fn clientFn(port: u16) !void {
+            const addr = try IpAddress.parseIp4("127.0.0.1", port);
+            const client = try addr.connect(.{});
+            defer client.close();
+
+            var write_buffer: [32]u8 = undefined;
+            var writer = client.writer(&write_buffer);
+            try writer.interface.writeAll("hello\n");
+            try writer.interface.flush();
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    const server = try listenAny6(false);
+    defer server.close();
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(Test.serverFn, .{server});
+    try group.spawn(Test.clientFn, .{server.socket.address.ip.getPort()});
+
+    try group.wait();
 }
 
 test "IpAddress: connected and accepted streams have Nagle's algorithm disabled" {

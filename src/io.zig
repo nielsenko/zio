@@ -2334,14 +2334,7 @@ fn netBindIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.n
 
     if (options.ip6_only) |ip6_only| {
         if (zio_addr.any.family != os_net.AF.INET6) return error.OptionUnsupported;
-        const value: c_int = @intFromBool(ip6_only);
-        // IPV6_V6ONLY optname: 26 on Linux, 27 on BSD/macOS/Windows.
-        const v6only: u32 = switch (builtin.os.tag) {
-            .linux => 26,
-            else => 27,
-        };
-        os_net.setsockopt(handle, os_net.IPPROTO.IPV6, v6only, std.mem.asBytes(&value)) catch
-            return error.OptionUnsupported;
+        os_net.setIp6Only(handle, ip6_only) catch return error.OptionUnsupported;
     }
 
     if (options.allow_broadcast) {
