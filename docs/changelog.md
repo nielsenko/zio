@@ -48,6 +48,10 @@ All notable changes to this project will be documented in this file.
 - Added `File.syncRange`, a wrapper for Linux's `sync_file_range`, to start writeback of
   a byte range ahead of a `sync`.
 
+- Added `ip6_only` to `IpAddress.ListenOptions` and `IpAddress.BindOptions`, to set
+  `IPV6_V6ONLY` on an IPv6 socket. Off, the socket also takes IPv4 peers, which Windows
+  refuses by default.
+
 ### Fixed
 
 - `std.Io` `sendManyTimeout` lost the count of messages already sent when it timed out or

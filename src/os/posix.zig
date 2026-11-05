@@ -39,6 +39,12 @@ pub const IPPROTO = struct {
 };
 pub const TCP = system.TCP;
 
+/// Options at level IPPROTO.IPV6, which std has for Linux alone.
+pub const IPV6 = struct {
+    /// 26 on Linux, 27 on the BSDs, macOS and Windows.
+    pub const V6ONLY: u32 = if (builtin.os.tag == .linux) 26 else 27;
+};
+
 pub const timespec = sys.timespec;
 pub const off_t = sys.off_t;
 
