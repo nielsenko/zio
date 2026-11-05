@@ -54,6 +54,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A listener with `reuse_address` on Windows set `SO_REUSEADDR`, which let any other
+  socket bind its port while it listened. It now sets `SO_EXCLUSIVEADDRUSE`, also
+  reachable as `Socket.setExclusiveAddressUse`.
+
 - `std.Io` `sendManyTimeout` lost the count of messages already sent when it timed out or
   was canceled, and restarted the timeout for each message.
 
