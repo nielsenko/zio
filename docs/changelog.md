@@ -20,6 +20,11 @@ All notable changes to this project will be documented in this file.
   the driver, for example to have it cancel one of its operations, without parking an
   `ev.Async` in the queue. Added the `zio.Interruptible` error set.
 
+- Added `ip6_only` to `IpAddress.ListenOptions` and `IpAddress.BindOptions`, to set
+  `IPV6_V6ONLY` on an IPv6 socket. Off, the socket also takes IPv4 peers, which Windows
+  refuses by default. OpenBSD can't turn it off, and fails with
+  `error.OptionNotSupported`.
+
 ### Changed
 
 - Tasks woken by I/O completions are scheduled as each completion is processed again,
