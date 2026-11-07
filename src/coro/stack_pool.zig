@@ -106,6 +106,13 @@ pub const Config = struct {
     /// worth of stacks before handing any back, so the spawner carves that
     /// many extra slots once. 0 disables the caches.
     local_cache: usize = 16,
+
+    /// Fill each stack with a pattern when a task gets it, and find the
+    /// lowest word its task overwrote when it comes back, so that
+    /// `StackPool.highWater` reports the deepest stack use. Every hand-out
+    /// then writes the whole committed region, which makes it resident, so
+    /// this is for measuring `committed_size`, not for production.
+    track_high_water: bool = false,
 };
 
 pub const StackPool = struct {
@@ -134,6 +141,8 @@ pub const StackPool = struct {
     /// per interval on the way down (see Config.shrink_interval).
     retain_target: usize,
     last_shrink: Timestamp,
+    /// The deepest stack use `release` has seen, with `track_high_water`.
+    high_water: usize,
 
     pub fn init(config: Config) StackPool {
         // Same slot layout as stackAllocPosix: usable size rounded to pages,
@@ -153,6 +162,7 @@ pub const StackPool = struct {
             .epoch_peak = 0,
             .retain_target = 0,
             .last_shrink = .zero,
+            .high_water = 0,
         };
     }
 
@@ -188,7 +198,33 @@ pub const StackPool = struct {
     /// Acquires a stack from the pool, or allocates a new one if the pool is empty.
     /// All stacks from this pool have the configured maximum_size and committed_size.
     pub fn acquire(self: *StackPool) error{OutOfMemory}!StackInfo {
-        return self.acquireExtra(null, 0);
+        return self.handOut(try self.acquireExtra(null, 0));
+    }
+
+    /// The deepest stack use seen by `release`, in bytes below the top of the
+    /// stack. Zero unless `Config.track_high_water` is set. A stack that grew
+    /// past its committed size counts all it committed, an upper bound.
+    pub fn highWater(self: *StackPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.high_water;
+    }
+
+    /// Prepare a stack that is about to be given to a task: with
+    /// `track_high_water`, fill it so its return can be measured.
+    fn handOut(self: *StackPool, stack_info: StackInfo) StackInfo {
+        if (self.config.track_high_water) fillUnused(stack_info);
+        return stack_info;
+    }
+
+    /// Record how deep a task used a stack it is giving back, with
+    /// `track_high_water`. Must run before anything writes a FreeNode into it.
+    fn noteReturn(self: *StackPool, stack_info: StackInfo) void {
+        if (!self.config.track_high_water) return;
+        const depth = usedDepth(stack_info);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.high_water = @max(self.high_water, depth);
     }
 
     /// Acquire a stack for the caller and, under the same lock hold, move up
@@ -281,6 +317,8 @@ pub const StackPool = struct {
     /// onto the pool's list. Returning memory to the OS happens only in the
     /// periodic shrink pass.
     pub fn release(self: *StackPool, stack_info: StackInfo) void {
+        self.noteReturn(stack_info);
+
         if (freeNodeAddr(stack_info) == null) {
             // Stack is too small to hold the FreeNode, free it instead of pooling
             std.debug.assert(!slab_supported or stack.stackReadOwnerTag(stack_info) == 0);
@@ -606,9 +644,9 @@ pub const StackCache = struct {
         if (self.head) |node| {
             self.head = node.next;
             self.count -= 1;
-            return node.stack_info;
+            return pool.handOut(node.stack_info);
         }
-        return pool.acquireExtra(self, pool.config.local_cache / 2);
+        return pool.handOut(try pool.acquireExtra(self, pool.config.local_cache / 2));
     }
 
     /// Push a stack, handing the older half back to the pool (under one
@@ -619,6 +657,7 @@ pub const StackCache = struct {
         if (capacity == 0 or StackPool.freeNodeAddr(stack_info) == null) {
             return pool.release(stack_info);
         }
+        pool.noteReturn(stack_info);
         self.push(stack_info);
         if (self.count > capacity) pool.releaseBatch(self, capacity / 2);
     }
@@ -727,6 +766,91 @@ test "StackCache: a zero capacity routes everything to the pool" {
     try std.testing.expectEqual(1, pool.in_use);
     try std.testing.expectEqual(0, cache.count);
     pool.release(c);
+}
+
+const unused_byte: u8 = 0xa5;
+const unused_word: usize = @as(usize, std.math.maxInt(usize) / 0xff) * unused_byte;
+
+/// Writes `unused_byte` over the committed stack below its top.
+fn fillUnused(stack_info: StackInfo) void {
+    const bytes: [*]u8 = @ptrFromInt(stack_info.limit);
+    @memset(bytes[0 .. stack_info.base - stack_info.limit], unused_byte);
+}
+
+/// Bytes from the top of the stack down to the lowest word that no longer
+/// holds the fill.
+fn usedDepth(stack_info: StackInfo) usize {
+    var addr = stack_info.limit;
+    while (addr + @sizeOf(usize) <= stack_info.base) : (addr += @sizeOf(usize)) {
+        const word: *const usize = @ptrFromInt(addr);
+        if (word.* != unused_word) break;
+    }
+    return stack_info.base - addr;
+}
+
+test "StackPool high water: release keeps the deepest use" {
+    var pool = StackPool.init(.{
+        .maximum_size = 256 * 1024,
+        .committed_size = 64 * 1024,
+        .track_high_water = true,
+    });
+    defer pool.deinit();
+
+    const deep = try pool.acquire();
+    const deep_top: [*]u8 = @ptrFromInt(deep.base - 10 * 1024);
+    @memset(deep_top[0 .. 10 * 1024], 0);
+    pool.release(deep);
+    try std.testing.expectEqual(10 * 1024, pool.highWater());
+
+    // The same slot again, used less deeply.
+    const shallow = try pool.acquire();
+    try std.testing.expectEqual(deep.base, shallow.base);
+    const shallow_top: [*]u8 = @ptrFromInt(shallow.base - 1024);
+    @memset(shallow_top[0..1024], 0);
+    pool.release(shallow);
+    try std.testing.expectEqual(10 * 1024, pool.highWater());
+}
+
+test "StackPool high water: stacks through a StackCache are measured" {
+    var pool = StackPool.init(.{
+        .maximum_size = 256 * 1024,
+        .committed_size = 64 * 1024,
+        .track_high_water = true,
+    });
+    defer pool.deinit();
+    var cache: StackCache = .{};
+
+    // Released into the cache, not the pool, and still measured.
+    const first = try cache.acquire(&pool);
+    const first_top: [*]u8 = @ptrFromInt(first.base - 4 * 1024);
+    @memset(first_top[0 .. 4 * 1024], 0);
+    cache.release(&pool, first);
+    try std.testing.expectEqual(1, cache.count);
+    try std.testing.expectEqual(4 * 1024, pool.highWater());
+
+    // Popped from the cache, refilled, and measured again.
+    const again = try cache.acquire(&pool);
+    try std.testing.expectEqual(first.base, again.base);
+    const again_top: [*]u8 = @ptrFromInt(again.base - 12 * 1024);
+    @memset(again_top[0 .. 12 * 1024], 0);
+    cache.release(&pool, again);
+    try std.testing.expectEqual(12 * 1024, pool.highWater());
+
+    cache.flush(&pool);
+}
+
+test "StackPool high water: stays zero without tracking" {
+    var pool = StackPool.init(.{
+        .maximum_size = 256 * 1024,
+        .committed_size = 64 * 1024,
+    });
+    defer pool.deinit();
+
+    const info = try pool.acquire();
+    const top: [*]u8 = @ptrFromInt(info.base - 1024);
+    @memset(top[0..1024], 0);
+    pool.release(info);
+    try std.testing.expectEqual(0, pool.highWater());
 }
 
 test "StackPool basic acquire and release" {
