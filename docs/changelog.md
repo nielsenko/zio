@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `track_high_water` to the stack pool options in `RuntimeOptions.stack_pool`.
+  Turned on, each stack is filled with a pattern when a task gets it, and
+  `StackPool.highWater` reports the deepest stack use seen, to size `committed_size`
+  from a measurement.
+
 ### Fixed
 
 - `setsockopt` failing with `EINVAL`, such as `TCP_NODELAY` on an already shut down
