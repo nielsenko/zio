@@ -526,11 +526,13 @@ pub fn cleanupStackGrowth() void {
     if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
     if (altstack_installed) {
-        // Disable alternate stack
+        // macOS refuses to disable a stack whose given size is below
+        // MINSIGSTKSZ, with ENOMEM. The stack would then stay installed on
+        // the memory freed below.
         var disable_stack = posix.stack_t{
             .flags = posix.SS.DISABLE,
             .sp = null,
-            .size = 0,
+            .size = posix.MINSIGSTKSZ,
         };
         posix.sigaltstack(&disable_stack, null) catch {
             // Best effort - can't do much if this fails
