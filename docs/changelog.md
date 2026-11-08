@@ -67,6 +67,9 @@ All notable changes to this project will be documented in this file.
 
 - Fixed a crash when `std.Io.swapCancelProtection` unblocked cancellation that was not blocked.
 
+- Fixed an executor thread on macOS keeping its alternate signal stack installed after the
+  runtime freed it, because macOS refused the disable call.
+
 ## [0.20.1] - 2026-11-12
 
 ### Fixed
