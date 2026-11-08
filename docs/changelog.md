@@ -56,6 +56,9 @@ All notable changes to this project will be documented in this file.
 - On macOS, an executor thread kept its alternate signal stack installed after the
   runtime freed it, because macOS refused the disable call.
 
+- An executor thread keeps the alternate signal stack that `std.Thread` gave it, which
+  zio used to replace with a smaller one.
+
 - `std.Io` `sendManyTimeout` lost the count of messages already sent when it timed out or
   was canceled, and restarted the timeout for each message.
 
