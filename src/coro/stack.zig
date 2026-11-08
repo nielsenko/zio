@@ -25,7 +25,7 @@ const is_pre_016 = builtin.zig_version.major == 0 and builtin.zig_version.minor 
 const SigInt = if (is_pre_016) c_int else posix.SIG;
 
 // Stack growth signal handler state (POSIX only)
-threadlocal var altstack_installed: bool = false;
+/// The alternate signal stack `installAltStack` mapped on this thread.
 threadlocal var altstack_mem: ?[]u8 = null;
 var signal_handler_refcount: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var old_sigsegv_action: posix.Sigaction = undefined;
@@ -477,24 +477,7 @@ pub fn setupStackGrowth() !void {
     // faults on the guard page and crashes.
     if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
-    const altstack_size = posix.SIGSTKSZ;
-
-    // Setup alternate stack for this thread if not already done
-    if (!altstack_installed) {
-        const mem = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page_size), altstack_size);
-        errdefer std.heap.page_allocator.free(mem);
-
-        var stack = posix.stack_t{
-            .flags = 0,
-            .sp = mem.ptr,
-            .size = altstack_size,
-        };
-
-        try posix.sigaltstack(&stack, null);
-
-        altstack_mem = mem;
-        altstack_installed = true;
-    }
+    try installAltStack();
 
     // Install global signal handler (once per process)
     // Increment refcount; if this is the first caller, install the handler
@@ -515,17 +498,45 @@ pub fn setupStackGrowth() !void {
     }
 }
 
-/// Cleanup stack growth handler state for this thread.
-/// Disables the alternate stack and frees its memory.
-/// Decrements the global signal handler refcount and uninstalls the handler when it reaches 0.
-/// On Windows: No-op (nothing to clean up)
+/// Gives the calling thread an alternate signal stack for the growth
+/// handler to run on, unless it has one of at least `SIGSTKSZ` already, as
+/// a thread from `std.Thread` does. Idempotent. A stack this maps stays
+/// until `releaseAltStack` runs on this thread.
 ///
-/// Should be called when a thread exits if setupStackGrowth() was called.
-pub fn cleanupStackGrowth() void {
-    // Windows and OpenBSD install no growth handler / alternate stack.
+/// Every call asks the kernel again. Whoever installed the thread's stack
+/// can take it away between two calls.
+fn installAltStack() !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
-    if (altstack_installed) {
+    const altstack_size = posix.SIGSTKSZ;
+    var current: posix.stack_t = undefined;
+    try posix.sigaltstack(null, &current);
+    if (current.flags & posix.SS.DISABLE == 0 and current.size >= altstack_size) return;
+
+    const mem = altstack_mem orelse try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page_size), altstack_size);
+    errdefer if (altstack_mem == null) std.heap.page_allocator.free(mem);
+
+    var stack = posix.stack_t{
+        .flags = 0,
+        .sp = mem.ptr,
+        .size = altstack_size,
+    };
+
+    try posix.sigaltstack(&stack, null);
+
+    altstack_mem = mem;
+}
+
+/// Unmaps the stack `installAltStack` mapped on this thread, for a thread
+/// that stops running coroutines. Disables it first while it is still the
+/// thread's stack. A stack the thread had of its own stays as it is.
+fn releaseAltStack() void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
+    const mem = altstack_mem orelse return;
+
+    var current: posix.stack_t = undefined;
+    posix.sigaltstack(null, &current) catch return;
+    if (current.flags & posix.SS.DISABLE == 0 and current.sp == mem.ptr) {
         // macOS refuses to disable a stack whose given size is below
         // MINSIGSTKSZ, with ENOMEM. The stack would then stay installed on
         // the memory freed below.
@@ -534,18 +545,26 @@ pub fn cleanupStackGrowth() void {
             .sp = null,
             .size = posix.MINSIGSTKSZ,
         };
-        posix.sigaltstack(&disable_stack, null) catch {
-            // Best effort - can't do much if this fails
-        };
-
-        // Free the alternate stack memory
-        if (altstack_mem) |mem| {
-            std.heap.page_allocator.free(mem);
-            altstack_mem = null;
-        }
-
-        altstack_installed = false;
+        // A stack the thread may still switch to must not be unmapped.
+        posix.sigaltstack(&disable_stack, null) catch return;
     }
+
+    std.heap.page_allocator.free(mem);
+    altstack_mem = null;
+}
+
+/// Cleanup stack growth handler state for this thread.
+/// Takes down the alternate stack `installAltStack` mapped, see
+/// `releaseAltStack`.
+/// Decrements the global signal handler refcount and uninstalls the handler when it reaches 0.
+/// On Windows: No-op (nothing to clean up)
+///
+/// Should be called when a thread exits if setupStackGrowth() was called.
+pub fn cleanupStackGrowth() void {
+    // Windows and OpenBSD install no growth handler / alternate stack.
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
+
+    releaseAltStack();
 
     // Decrement refcount; if this was the last thread, uninstall the handler
     const prev_refcount = signal_handler_refcount.fetchSub(1, .release);
@@ -836,6 +855,83 @@ test "Stack: recycle" {
     // Stack info should remain unchanged
     try std.testing.expect(stack.limit == committed_start);
     try std.testing.expect(stack.base - stack.limit == committed_len);
+}
+
+test "installAltStack: a thread gets a stack again after the owner of its stack took it away" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
+
+    const Thread = struct {
+        fn run(result: *anyerror!posix.stack_t) void {
+            result.* = installTwice();
+        }
+
+        fn installTwice() !posix.stack_t {
+            // The stack `std.Thread` gave this thread counts as its own.
+            try installAltStack();
+            // macOS wants a valid size even to disable a stack.
+            var disable = posix.stack_t{ .flags = posix.SS.DISABLE, .sp = null, .size = posix.MINSIGSTKSZ };
+            try posix.sigaltstack(&disable, null);
+            try installAltStack();
+            defer releaseAltStack();
+            var current: posix.stack_t = undefined;
+            try posix.sigaltstack(null, &current);
+            return current;
+        }
+    };
+    var result: anyerror!posix.stack_t = error.NotRun;
+    const thread = try std.Thread.spawn(.{}, Thread.run, .{&result});
+    thread.join();
+    const stack = try result;
+    try std.testing.expect(stack.flags & posix.SS.DISABLE == 0);
+    try std.testing.expect(stack.size >= posix.SIGSTKSZ);
+}
+
+test "releaseAltStack: unmaps the stack installAltStack mapped, and leaves one installed since" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
+
+    const Thread = struct {
+        const Outcome = struct { disabled: bool, other_kept: bool };
+
+        fn run(result: *anyerror!Outcome) void {
+            result.* = mapAndRelease();
+        }
+
+        /// What `installAltStack` does where std's stack is too small.
+        fn mapStack() !void {
+            const mem = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page_size), posix.SIGSTKSZ);
+            var stack = posix.stack_t{ .flags = 0, .sp = mem.ptr, .size = mem.len };
+            try posix.sigaltstack(&stack, null);
+            altstack_mem = mem;
+        }
+
+        fn mapAndRelease() !Outcome {
+            var current: posix.stack_t = undefined;
+
+            try mapStack();
+            releaseAltStack();
+            try posix.sigaltstack(null, &current);
+            const disabled = current.flags & posix.SS.DISABLE != 0 and altstack_mem == null;
+
+            try mapStack();
+            var other: [posix.SIGSTKSZ]u8 align(16) = undefined;
+            var replacement = posix.stack_t{ .flags = 0, .sp = &other, .size = other.len };
+            try posix.sigaltstack(&replacement, null);
+            releaseAltStack();
+            try posix.sigaltstack(null, &current);
+            const other_kept = current.flags & posix.SS.DISABLE == 0 and current.sp == @as(@TypeOf(current.sp), @ptrCast(&other));
+            var disable = posix.stack_t{ .flags = posix.SS.DISABLE, .sp = null, .size = posix.MINSIGSTKSZ };
+            try posix.sigaltstack(&disable, null);
+            return .{ .disabled = disabled, .other_kept = other_kept and altstack_mem == null };
+        }
+    };
+    var result: anyerror!Thread.Outcome = error.NotRun;
+    const thread = try std.Thread.spawn(.{}, Thread.run, .{&result});
+    thread.join();
+    const outcome = try result;
+    try std.testing.expect(outcome.disabled);
+    try std.testing.expect(outcome.other_kept);
 }
 
 pub fn crashHandler() void {
