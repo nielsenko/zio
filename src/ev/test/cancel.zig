@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const options = @import("../../options.zig").options;
 const time = @import("../../time.zig");
 const ev = @import("../root.zig");
 const os = @import("../../os/root.zig");
@@ -606,4 +608,46 @@ test "cancel: cross-thread cancellation" {
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     try std.testing.expectError(error.Canceled, timer.getResult());
+}
+
+test "cancel: a recv outlives the thread that submitted it" {
+    if (builtin.single_threaded or builtin.os.tag == .windows) return error.SkipZigTest;
+    // A SINGLE_ISSUER ring refuses every thread but its creator. The Linux
+    // backend picks io_uring at runtime unless one is named.
+    if (builtin.os.tag == .linux and options.io_uring_single_issuer) {
+        const backend = options.backend orelse .linux;
+        if (backend == .linux or backend == .io_uring) return error.SkipZigTest;
+    }
+
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    const fds = try net.socketpair(.unix, .stream, .ip, .{ .nonblocking = true });
+    defer net.close(fds[0]);
+    defer net.close(fds[1]);
+
+    var buf: [16]u8 = undefined;
+    var read_iov: [1]os.iovec = undefined;
+    var recv: NetRecv = .init(fds[0], .fromSlice(&buf, &read_iov), .{});
+
+    const Submitter = struct {
+        fn run(l: *Loop, c: *ev.Completion, failed: *bool) void {
+            l.adoptThread();
+            l.add(c);
+            l.poll(.zero) catch {
+                failed.* = true;
+            };
+        }
+    };
+    var failed = false;
+    const thread = try std.Thread.spawn(.{}, Submitter.run, .{ &loop, &recv.c, &failed });
+    thread.join();
+    try std.testing.expect(!failed);
+    try std.testing.expectEqual(.running, recv.c.loadState().phase);
+
+    var send_iov = [_]net.iovec_const{net.iovecConstFromSlice("hello")};
+    _ = try net.send(fds[1], &send_iov, .{});
+    try loop.run();
+    try std.testing.expectEqualStrings("hello", buf[0..try recv.getResult()]);
 }

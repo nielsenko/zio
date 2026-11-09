@@ -76,6 +76,9 @@ pub fn Backend(comptime mode: Mode) type {
             .epoll => Epoll.ProcessWaitData,
         };
 
+        /// See `IoUring.CompletionData`. The epoll engine keeps none.
+        pub const CompletionData = if (mode == .epoll) struct {} else IoUring.CompletionData;
+
         pub const SharedState = struct {
             selection_mutex: os.Mutex = .init(),
             selection: Selection = .undecided,
