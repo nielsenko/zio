@@ -55,6 +55,8 @@ pub const stackRecycle = stack.stackRecycle;
 pub const stackExtend = stack.stackExtend;
 pub const setupStackGrowth = stack.setupStackGrowth;
 pub const cleanupStackGrowth = stack.cleanupStackGrowth;
+pub const installAltStack = stack.installAltStack;
+pub const releaseAltStack = stack.releaseAltStack;
 pub const crashHandler = stack.crashHandler;
 
 pub const StackPool = @import("stack_pool.zig").StackPool;

@@ -29,6 +29,9 @@ All notable changes to this project will be documented in this file.
 - Added `Loop.adoptThread` and `Loop.releaseThread`, to move a loop's debug-only
   ownership check to another thread.
 
+- Exported `coro.installAltStack` and `coro.releaseAltStack`, for a thread that runs
+  coroutines and got no alternate signal stack from `Runtime.init`.
+
 - Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
   `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
   `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.
