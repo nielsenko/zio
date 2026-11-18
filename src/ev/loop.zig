@@ -618,6 +618,18 @@ pub const Loop = struct {
             self.backend.hasPendingChanges();
     }
 
+    /// Makes the calling thread the loop's owner for the debug-only
+    /// ownership checks.
+    pub fn adoptThread(self: *Loop) void {
+        if (in_debug_mode) current_loop = self;
+    }
+
+    /// Ends the calling thread's ownership. Asserts it is the owner.
+    pub fn releaseThread(self: *Loop) void {
+        self.assertOwnThread();
+        if (in_debug_mode) current_loop = null;
+    }
+
     /// Debug-only: assert we're on the thread that owns this loop.
     inline fn assertOwnThread(self: *const Loop) void {
         if (in_debug_mode) std.debug.assert(current_loop == self);
