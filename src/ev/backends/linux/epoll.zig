@@ -295,6 +295,11 @@ pub fn hostHandle(self: *const Self) ?net.fd_t {
     return self.epoll_fd;
 }
 
+/// See `Loop.adoptWakeThread`. Wakes go to a descriptor here.
+pub fn adoptWakeThread(self: *Self) void {
+    _ = self;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     posix.eventfd_write(self.waker_eventfd, 1) catch {};
