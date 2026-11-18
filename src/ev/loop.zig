@@ -703,8 +703,34 @@ pub const Loop = struct {
     /// A descriptor that is readable when the loop has events, for a host
     /// to wait on between ticks. Null on a backend that has none. The host
     /// must not read from it.
+    ///
+    /// On IOCP it is the completion port. The host posts each entry it
+    /// dequeues back with `PostQueuedCompletionStatus`, and waits
+    /// alertably, since a `wake` arrives as an APC.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
+    }
+
+    /// Sends cross-thread wakes to the calling thread. Only IOCP wakes a
+    /// thread, and this does nothing elsewhere. Assumes no other thread
+    /// calls it at the same time.
+    pub fn adoptWakeThread(self: *Loop) void {
+        self.backend.adoptWakeThread();
+    }
+
+    /// The wake target `borrowWakeThread` replaced. Only IOCP has one.
+    const WakeLoan = if (@hasDecl(Backend, "WakeLoan")) Backend.WakeLoan else void;
+    const no_wake_loan: WakeLoan = if (WakeLoan == void) {} else null;
+
+    /// `adoptWakeThread` until `returnWakeThread`.
+    fn borrowWakeThread(self: *Loop) WakeLoan {
+        if (WakeLoan == void) return {};
+        return self.backend.borrowWakeThread();
+    }
+
+    fn returnWakeThread(self: *Loop, loan: WakeLoan) void {
+        if (WakeLoan == void) return;
+        self.backend.returnWakeThread(loan);
     }
 
     /// Announces a wait on `hostHandle`. Until the next poll, a `wake`
@@ -1629,6 +1655,11 @@ pub const Loop = struct {
         // backend, and polling takes it, so the handle goes quiet.
         const host_waited = self.state.wake_requested.load(.acquire) & LoopState.sleeping != 0;
         const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges() or host_waited;
+        // IOCP wakes a thread, and the host may have pointed the wakes at
+        // another one. Take them before announcing the sleep. A wake after
+        // the poll leaves a request that `prepareHostWait` sees.
+        const wake_loan = if (should_poll and timeout.value != 0) self.borrowWakeThread() else no_wake_loan;
+        defer self.returnWakeThread(wake_loan);
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.

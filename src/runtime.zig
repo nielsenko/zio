@@ -2862,10 +2862,17 @@ test "Loop: the host handle and the next timer deadline" {
 
     const deadline = loop.nextTimerDeadline().?;
     try std.testing.expect(deadline.toMilliseconds() <= 30);
-    // A Windows handle is a SOCKET, and no Windows backend has one.
+    // A Windows handle is a pointer, with no sign to check.
     if (builtin.os.tag != .windows) {
         if (loop.hostHandle()) |fd| try std.testing.expect(fd >= 0);
     }
+}
+
+/// The loop's host handle, if `poll` can wait on it. The IOCP one is a
+/// completion port, which has no readiness, see `Loop.hostHandle`.
+fn pollableHostHandle(loop: *const ev.Loop) ?os.net.fd_t {
+    if (builtin.os.tag == .windows) return null;
+    return loop.hostHandle();
 }
 
 /// Whether `fd` is readable within `timeout_ms`.
@@ -2879,7 +2886,7 @@ test "Executor.tick: a task woken from another thread makes the host handle read
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const loop = &runtime.main_executor.loop;
-    const fd = loop.hostHandle() orelse return error.SkipZigTest;
+    const fd = pollableHostHandle(loop) orelse return error.SkipZigTest;
 
     const Event = @import("sync/Event.zig");
     const Task = struct {
@@ -2925,7 +2932,7 @@ test "Executor.tick: the tick after a wake leaves the host handle quiet" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const loop = &runtime.main_executor.loop;
-    const fd = loop.hostHandle() orelse return error.SkipZigTest;
+    const fd = pollableHostHandle(loop) orelse return error.SkipZigTest;
     _ = try runtime.main_executor.tick(.zero);
     try std.testing.expect(loop.prepareHostWait());
     loop.wake();
@@ -3092,6 +3099,185 @@ test "Executor.tick: a task grows its stack on a host thread that had no signal 
     thread.join();
     try result;
     try std.testing.expect(done);
+}
+
+test "Loop.adoptWakeThread: a wake from another thread ends the wait of a tick on the adopting thread" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const Task = struct {
+        fn run(event: *Event, done: *bool) !void {
+            try event.wait();
+            done.* = true;
+        }
+    };
+    const Setter = struct {
+        fn run(event: *Event) void {
+            os.time.sleep(.fromMilliseconds(50));
+            event.set();
+        }
+    };
+    const Host = struct {
+        fn tick(executor: *Executor, elapsed_ms: *u64, failed: *bool) void {
+            HostThread.enter(executor) catch {
+                failed.* = true;
+                return;
+            };
+            defer HostThread.leave(executor);
+            // The host waits inside the tick, so the wakes come here.
+            executor.loop.adoptWakeThread();
+            const start = Timestamp.now(.monotonic);
+            _ = executor.tick(.fromSeconds(2)) catch {
+                failed.* = true;
+            };
+            elapsed_ms.* = start.untilNow(.monotonic).toMilliseconds();
+        }
+    };
+    var event = Event.init;
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ &event, &done });
+    defer handle.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    var elapsed_ms: u64 = 0;
+    var failed = false;
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{&event});
+    defer setter.join();
+    const host = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &elapsed_ms, &failed });
+    host.join();
+    try std.testing.expect(!failed);
+    try std.testing.expect(elapsed_ms < 1000);
+
+    while (try runtime.main_executor.tick(.zero)) {}
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: a wake ends the wait of a tick on a thread the host did not give the wakes to" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (ringRefusesOtherThreads()) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+
+    const Event = @import("sync/Event.zig");
+    const Task = struct {
+        fn run(event: *Event, done: *bool) !void {
+            try event.wait();
+            done.* = true;
+        }
+    };
+    const Setter = struct {
+        fn run(event: *Event) void {
+            os.time.sleep(.fromMilliseconds(50));
+            event.set();
+        }
+    };
+    const Host = struct {
+        /// Takes the wakes, as a host's waiting thread does, and stays
+        /// alive until the test is done.
+        fn wait(host_loop: *ev.Loop, adopted: *os.ResetEvent, finished: *os.ResetEvent) void {
+            host_loop.adoptWakeThread();
+            adopted.set();
+            finished.wait();
+        }
+    };
+    var event = Event.init;
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ &event, &done });
+    defer handle.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    var adopted: os.ResetEvent = .init();
+    var finished: os.ResetEvent = .init();
+    const host = try std.Thread.spawn(.{}, Host.wait, .{ loop, &adopted, &finished });
+    defer host.join();
+    defer finished.set();
+    // The wakes come back here before the host thread exits.
+    defer loop.adoptWakeThread();
+    adopted.wait();
+
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{&event});
+    defer setter.join();
+    const start = Timestamp.now(.monotonic);
+    _ = try runtime.main_executor.tick(.fromSeconds(2));
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: a real-clock timer ends the wait of a tick on another thread than the one that armed it" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(done: *bool) !void {
+            var timer = ev.Timer.initClock(.{ .duration = .fromMilliseconds(300) }, .real);
+            try common.waitForIo(&timer.c);
+            done.* = true;
+        }
+    };
+    const Host = struct {
+        fn tick(executor: *Executor, failed: *bool) void {
+            HostThread.enter(executor) catch {
+                failed.* = true;
+                return;
+            };
+            defer HostThread.leave(executor);
+            _ = executor.tick(.zero) catch {
+                failed.* = true;
+            };
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{&done});
+    defer handle.cancel();
+
+    // The poll of the tick on this thread arms the waitable timer.
+    var failed = false;
+    const thread = try std.Thread.spawn(.{}, Host.tick, .{ &runtime.main_executor, &failed });
+    thread.join();
+    try std.testing.expect(!failed);
+
+    const start = Timestamp.now(.monotonic);
+    while (!done) {
+        _ = try runtime.main_executor.tick(.fromSeconds(5));
+        try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 2000);
+    }
+}
+
+test "Executor.run: gives the wakes back to the thread the host gave them to" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Host = struct {
+        /// Takes the wakes, as a host's waiting thread does, and stays
+        /// alive until the test is done with its id.
+        fn wait(loop: *ev.Loop, adopted: *os.ResetEvent, done: *os.ResetEvent) void {
+            loop.adoptWakeThread();
+            adopted.set();
+            done.wait();
+        }
+    };
+    var adopted: os.ResetEvent = .init();
+    var done: os.ResetEvent = .init();
+    const host = try std.Thread.spawn(.{}, Host.wait, .{ &runtime.main_executor.loop, &adopted, &done });
+    defer host.join();
+    defer done.set();
+    adopted.wait();
+    const backend = &runtime.main_executor.loop.backend;
+    const host_thread = backend.wake_thread_id;
+
+    // Joining makes the main task wait, which runs the executor here.
+    const Task = struct {
+        fn run() void {}
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    handle.join();
+    try std.testing.expectEqual(host_thread, backend.wake_thread_id);
 }
 
 test "Executor.tick: a host shuts down on another thread than the one that started the runtime" {

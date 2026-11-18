@@ -12,6 +12,10 @@ All notable changes to this project will be documented in this file.
   `RunMode.once`. A tick from inside one of the executor's own tasks returns
   `error.AlreadyRunning`. See the new Host Event Loop page.
 
+- Added `Loop.adoptWakeThread`, to send IOCP wakes to the thread a host waits on when that
+  is not the thread that ticks. A poll that waits on another thread takes them for that
+  wait.
+
 - Added `Loop.adoptThread` and `Loop.releaseThread`, to move a loop's debug-only
   ownership check to another thread.
 
