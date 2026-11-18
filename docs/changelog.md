@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `Executor.tick`, to drive an executor from a host's own event loop one pass at a
+  time, and `Loop.hostHandle`, `Loop.nextTimerDeadline` and `Loop.prepareHostWait`, to
+  tell the host when to tick again. A tick is `Executor.run` with the new
+  `RunMode.once`. A tick from inside one of the executor's own tasks returns
+  `error.AlreadyRunning`. See the new Host Event Loop page.
+
 ### Fixed
 
 - `setsockopt` failing with `EINVAL`, such as `TCP_NODELAY` on an already shut down
