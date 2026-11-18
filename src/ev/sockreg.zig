@@ -354,6 +354,49 @@ pub fn detach(self: anytype, target: *Completion) bool {
     return removed;
 }
 
+/// Gives up every direction `loop` owns, for a loop that leaves the group.
+/// Its poller goes with it, so a direction left in its name would never see
+/// another edge. A direction nobody waits on goes back to unowned, and the
+/// next parker registers it in its own loop. A direction with waiters moves
+/// to the loop of the first one: `registerOn` arms that loop's poller from
+/// this thread, and the loop services every waiter on the next edge.
+pub fn leave(
+    table: *Table,
+    loop: *Loop,
+    comptime registerOn: fn (loop: *Loop, fd: net.fd_t, dir: Dir, other_owned_here: bool) bool,
+) void {
+    const leaving: *anyopaque = @ptrCast(loop);
+    var stranded: usize = 0;
+    for (&table.shards) |*shard| {
+        shard.mutex.lock();
+        defer shard.mutex.unlock();
+        var it = shard.map.iterator();
+        while (it.next()) |kv| {
+            const fd: net.fd_t = @bitCast(kv.key_ptr.*);
+            const entry = kv.value_ptr;
+            for ([_]Dir{ .read, .write }) |dir| {
+                const owner = entry.ownerPtr(dir);
+                if (owner.* != leaving) continue;
+                owner.* = null;
+                const first = entry.waiters(dir).head orelse continue;
+                const heir = first.getLoop().?;
+                // The loop's own operations finished before it left.
+                std.debug.assert(heir != loop);
+                const heir_opaque: *anyopaque = @ptrCast(heir);
+                const other_owned_here = entry.ownerPtr(other(dir)).* == heir_opaque;
+                if (registerOn(heir, fd, dir, other_owned_here)) {
+                    owner.* = heir_opaque;
+                } else {
+                    // Unowned, the waiters wait for the next parker's
+                    // registration.
+                    stranded += 1;
+                }
+            }
+        }
+    }
+    if (stranded > 0) log.err("sock table: no loop took over {} socket directions after their owner left", .{stranded});
+}
+
 /// Tear down the shared registration for a socket fd about to be closed. Closing
 /// the fd removes it from every poller at the kernel level, so this only drops
 /// the software bookkeeping (for all loops at once) plus this loop's poller entry.

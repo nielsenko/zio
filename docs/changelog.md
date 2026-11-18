@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Added `Executor.tick`, to drive an executor from a host's own event loop one pass at a
+  time, and `Loop.hostHandle`, `Loop.nextTimerDeadline` and `Loop.prepareHostWait`, to
+  tell the host when to tick again. A tick is `Executor.run` with the new
+  `RunMode.once`. A tick from inside one of the executor's own tasks returns
+  `error.AlreadyRunning`. See the new Host Event Loop page.
+
+- Added `Loop.adoptWakeThread`, to send IOCP wakes to the thread a host waits on when that
+  is not the thread that ticks. A poll that waits on another thread takes them for that
+  wait.
+
+- Added `Loop.adoptThread` and `Loop.releaseThread`, to move a loop's debug-only
+  ownership check to another thread.
+
+- Exported `coro.installAltStack` and `coro.releaseAltStack`, for a thread that runs
+  coroutines and got no alternate signal stack from `Runtime.init`.
+
+- Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
+  `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
+  `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.
+
+- Added `ip6_only` to `IpAddress.ListenOptions` and `IpAddress.BindOptions`, to set
+  `IPV6_V6ONLY` on an IPv6 socket. Off, the socket also takes IPv4 peers, which Windows
+  refuses by default. OpenBSD can't turn it off, and fails with
+  `error.OptionNotSupported`.
+
+- Added `track_high_water` to the stack pool options in `RuntimeOptions.stack_pool`.
+  Turned on, each stack is filled with a pattern when a task gets it, and
+  `StackPool.highWater` reports the deepest stack use seen, to size `committed_size`
+  from a measurement.
+
+- Added `RuntimeOptions.loop_group`, to let runtimes share a caller-owned `LoopGroup`. A
+  stream accepted on one runtime can then be read on another, which IOCP needs, since a
+  socket stays bound to one completion port. `LoopGroup.allocator` allocates what the
+  group's loops share, and a runtime may leave the group before the others.
+
 ### Fixed
 
 - `setsockopt` failing with `EINVAL`, such as `TCP_NODELAY` on an already shut down
@@ -17,6 +54,12 @@ All notable changes to this project will be documented in this file.
 - Fixed `Server.accept` not timing out while queued connections kept failing.
 
 - Fixed a crash when `std.Io.swapCancelProtection` unblocked cancellation that was not blocked.
+
+- Fixed an executor thread on macOS keeping its alternate signal stack installed after the
+  runtime freed it, because macOS refused the disable call.
+
+- Fixed an executor thread replacing the alternate signal stack that `std.Thread` gave it
+  with a smaller one.
 
 ## [0.20.1] - 2026-11-12
 

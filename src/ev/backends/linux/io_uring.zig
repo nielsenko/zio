@@ -8,6 +8,7 @@ const time = @import("../../../os/time.zig");
 const Duration = @import("../../../time.zig").Duration;
 const Clock = @import("../../../time.zig").Clock;
 const common = @import("../common.zig");
+const options = @import("../../../options.zig").options;
 const LoopState = @import("../../loop.zig").LoopState;
 const Completion = @import("../../completion.zig").Completion;
 const Queue = @import("../../queue.zig").Queue;
@@ -413,9 +414,71 @@ test "AcceptHints: insert, find and remove across collisions" {
     try std.testing.expect(t.contains(100 + AcceptHints.size));
 }
 
+test "io_uring: a shared ring submits again what fails after another thread submitted it" {
+    if (options.io_uring_single_issuer) return error.SkipZigTest;
+    const E = linux.E;
+    const canceled = -@as(i32, @backingInt(E.CANCELED));
+    const fault = -@as(i32, @backingInt(E.FAULT));
+    const child = -@as(i32, @backingInt(E.CHILD));
+
+    var read: Completion = .init(.net_recv);
+    read.internal.submitter = std.Thread.getCurrentId() +% 1;
+    try std.testing.expect(submitterLeft(&read, canceled));
+    try std.testing.expect(submitterLeft(&read, fault));
+    try std.testing.expect(!submitterLeft(&read, child));
+    try std.testing.expect(!submitterLeft(&read, -@as(i32, @backingInt(E.IO))));
+
+    var wait: Completion = .init(.process_wait);
+    wait.internal.submitter = std.Thread.getCurrentId() +% 1;
+    try std.testing.expect(submitterLeft(&wait, child));
+
+    // The second time, from this thread, the result stands.
+    recordSubmitter(&read);
+    try std.testing.expect(!submitterLeft(&read, canceled));
+    try std.testing.expect(!submitterLeft(&read, fault));
+
+    // A cancel zio asked for is the cancel the result reports.
+    read.internal.submitter = std.Thread.getCurrentId() +% 1;
+    read.state.store(.{ .phase = .running, .cancel_requested = true }, .monotonic);
+    try std.testing.expect(!submitterLeft(&read, canceled));
+}
+
+test "io_uring: a waker poll the kernel ended is pending work until a poll arms it again" {
+    const Loop = @import("../../loop.zig").Loop;
+    const Timer = @import("../../completion.zig").Timer;
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    const engine = switch (loop.backend.engine) {
+        .io_uring => |*engine| engine,
+        .epoll => return error.SkipZigTest,
+    };
+    // A loop with nothing to do skips its poll.
+    var keep_alive: Timer = .init(.{ .duration = .zero });
+    loop.setTimer(&keep_alive, .{ .duration = .fromSeconds(60) });
+    defer _ = loop.clearTimer(&keep_alive);
+    try loop.poll(.zero);
+    try std.testing.expect(!loop.hasPendingWork());
+
+    // The kernel ends a multishot poll with a CQE that lacks F_MORE.
+    engine.drainWaker(.{ .user_data = specialUd(.waker, 0), .res = 0, .flags = 0 });
+    try std.testing.expect(loop.hasPendingWork());
+
+    try loop.poll(.zero);
+    try std.testing.expect(!loop.hasPendingWork());
+}
+
 const Self = @This();
 
 const log = @import("../../../common.zig").log;
+
+/// Per-completion state, for `Completion.internal`.
+pub const CompletionData = struct {
+    /// On a shared ring, the thread whose submit queued the request, see
+    /// `submitterLeft`.
+    submitter: if (options.io_uring_single_issuer) void else std.Thread.Id =
+        if (options.io_uring_single_issuer) {} else 0,
+};
 
 ring: linux.IoUring,
 waker_eventfd: i32,
@@ -448,8 +511,11 @@ accept_hints: AcceptHints = .{},
 
 pub fn init(self: *Self, _: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
-    flags |= linux.IORING_SETUP_SINGLE_ISSUER;
-    flags |= linux.IORING_SETUP_DEFER_TASKRUN;
+    if (options.io_uring_single_issuer) {
+        // DEFER_TASKRUN needs SINGLE_ISSUER.
+        flags |= linux.IORING_SETUP_SINGLE_ISSUER;
+        flags |= linux.IORING_SETUP_DEFER_TASKRUN;
+    }
     flags |= linux.IORING_SETUP_COOP_TASKRUN;
 
     const master_fd = shared_state.master_fd.load(.seq_cst);
@@ -544,6 +610,18 @@ pub fn deinit(self: *Self) void {
     }
 }
 
+/// See `Loop.hostHandle`. Null for a `DEFER_TASKRUN` ring, which holds
+/// completions until its issuer enters the kernel.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    if (options.io_uring_single_issuer) return null;
+    return self.ring.fd;
+}
+
+/// See `Loop.adoptWakeThread`. Wakes go to a descriptor here.
+pub fn adoptWakeThread(self: *Self) void {
+    _ = self;
+}
+
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     posix.eventfd_write(self.waker_eventfd, 1) catch {};
@@ -583,6 +661,14 @@ pub fn hasInflight(self: *const Self) bool {
     return self.inflight > 0;
 }
 
+/// Whether the next poll has something to submit. An unarmed waker counts,
+/// since no wake reaches the ring until a poll arms it again.
+pub fn hasPendingChanges(self: *const Self) bool {
+    if (self.waker_needs_rearm) return true;
+    // `IoUring.sq_ready` computes the same, but takes a mutable ring.
+    return self.ring.sq.sqe_tail -% @atomicLoad(u32, self.ring.sq.head, .acquire) > 0;
+}
+
 /// Submit a completion to the backend - infallible.
 /// On error, completes the operation immediately with error.Unexpected.
 /// `op` is `c.op`, passed at compile time so each op compiles to its own
@@ -592,14 +678,36 @@ pub fn submit(self: *Self, state: *LoopState, comptime op: Op, c: *Completion) v
     // markCompletedFromBackend); EINTR resubmissions go through resubmit and
     // stay counted from their first submit.
     self.inflight += 1;
+    recordSubmitter(c);
     self.submitInner(state, op, c, true);
 }
 
 fn resubmit(self: *Self, state: *LoopState, c: *Completion) void {
     std.debug.assert(c.loadState().phase == .running);
+    recordSubmitter(c);
     switch (c.op) {
         inline else => |op| self.submitInner(state, op, c, false),
     }
+}
+
+fn recordSubmitter(c: *Completion) void {
+    if (!options.io_uring_single_issuer) c.internal.submitter = std.Thread.getCurrentId();
+}
+
+/// Whether `res` may be the kernel failing a request because the thread
+/// that submitted it exited: -ECANCELED for a request the exit canceled,
+/// and -EFAULT for one still to be issued from that thread's task work
+/// (io_should_terminate_tw, io_uring/io_uring.h). A waitid run without the
+/// thread finds none of its children, and fails with -ECHILD. A request
+/// this thread submitted keeps any of these, so a real result comes back
+/// from the second submission and stands.
+fn submitterLeft(c: *const Completion, res: i32) bool {
+    const code = res == -@as(i32, @backingInt(linux.E.CANCELED)) or
+        res == -@as(i32, @backingInt(linux.E.FAULT)) or
+        (res == -@as(i32, @backingInt(linux.E.CHILD)) and c.op == .process_wait);
+    return code and
+        !c.loadState().cancel_requested and
+        c.internal.submitter != std.Thread.getCurrentId();
 }
 
 /// `is_new` distinguishes the first submission (allocate op-owned resources)
@@ -1522,6 +1630,12 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
         // Handle EINTR by deferring to pending — resubmit after armWaker so the
         // waker always gets priority over EINTR resubmissions.
         if (cqe.res == -@as(i32, @backingInt(linux.E.INTR))) {
+            self.pending.push(completion);
+            continue;
+        }
+
+        // Submit it again from this thread.
+        if (!options.io_uring_single_issuer and submitterLeft(completion, cqe.res)) {
             self.pending.push(completion);
             continue;
         }

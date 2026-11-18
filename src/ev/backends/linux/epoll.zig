@@ -210,8 +210,6 @@ pending_changes: usize = 0,
 epoll_pwait2_supported: bool = true,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
-    shared_state.sock_table.acquire(allocator);
-    errdefer shared_state.sock_table.release();
     const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
     const epoll_fd: i32 = switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -287,7 +285,16 @@ pub fn deinit(self: *Self) void {
     if (self.epoll_fd != -1) {
         _ = std.os.linux.close(self.epoll_fd);
     }
-    self.shared.sock_table.release();
+}
+
+/// See `Loop.hostHandle`.
+pub fn hostHandle(self: *const Self) ?net.fd_t {
+    return self.epoll_fd;
+}
+
+/// See `Loop.adoptWakeThread`. Wakes go to a descriptor here.
+pub fn adoptWakeThread(self: *Self) void {
+    _ = self;
 }
 
 pub fn wake(self: *Self, state: *LoopState) void {
@@ -578,6 +585,12 @@ pub fn decrInflight(self: *Self) void {
 /// wait syscall in no-wait ticks when nothing can arrive.
 pub fn hasInflight(self: *const Self) bool {
     return self.shared.inflight_io.load(.monotonic) > 0;
+}
+
+/// epoll applies a registration when it is made.
+pub fn hasPendingChanges(self: *const Self) bool {
+    _ = self;
+    return false;
 }
 
 /// Submit a completion to the backend - infallible.
