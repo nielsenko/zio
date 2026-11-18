@@ -26,6 +26,9 @@ All notable changes to this project will be documented in this file.
   `RunMode.once`. A tick from inside one of the executor's own tasks returns
   `error.AlreadyRunning`. See the new Host Event Loop page.
 
+- Added `Loop.adoptThread` and `Loop.releaseThread`, to move a loop's debug-only
+  ownership check to another thread.
+
 - Added the `io_uring_single_issuer` option (`-Dio_uring_single_issuer=false`, or in
   `zio_options`). Turned off, io_uring rings are created without `SINGLE_ISSUER` and
   `DEFER_TASKRUN`, so a host can drive a loop from different threads, one at a time.
