@@ -20,6 +20,12 @@ All notable changes to this project will be documented in this file.
   the driver, for example to have it cancel one of its operations, without parking an
   `ev.Async` in the queue. Added the `zio.Interruptible` error set.
 
+- Added `Executor.tick`, to drive an executor from a host's own event loop one pass at a
+  time, and `Loop.hostHandle`, `Loop.nextTimerDeadline` and `Loop.prepareHostWait`, to
+  tell the host when to tick again. A tick is `Executor.run` with the new
+  `RunMode.once`. A tick from inside one of the executor's own tasks returns
+  `error.AlreadyRunning`. See the new Host Event Loop page.
+
 ### Changed
 
 - Tasks woken by I/O completions are scheduled as each completion is processed again,
