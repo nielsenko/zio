@@ -200,6 +200,52 @@ const EVFILT_USER: i16 = switch (builtin.target.os.tag) {
 };
 const NOTE_TRIGGER: u32 = 0x01000000;
 
+/// The event of this backend's kqueue. Darwin's is the one `kevent64` takes,
+/// and a kqueue takes one form of the call for its whole life.
+const Kevent = if (builtin.os.tag.isDarwin()) extern struct {
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: i64,
+    udata: u64,
+    ext: [2]u64 = .{ 0, 0 },
+} else std.c.Kevent;
+
+comptime {
+    if (builtin.os.tag.isDarwin()) {
+        std.debug.assert(@sizeOf(Kevent) == @sizeOf(std.c.kevent64_s));
+        std.debug.assert(@offsetOf(Kevent, "ext") == @offsetOf(std.c.kevent64_s, "ext"));
+    }
+}
+
+/// `kevent`, which on Darwin does not wait when `timeout` is zero. XNU takes
+/// a zero timespec for a wait and parks the thread when the queue is empty.
+/// That call took 15 us on macOS 26.7 on an Intel CPU, and the same look
+/// with KEVENT_FLAG_IMMEDIATE took 0.5 us.
+fn kevent(
+    kq: c_int,
+    changelist: [*]const Kevent,
+    nchanges: c_int,
+    eventlist: [*]Kevent,
+    nevents: c_int,
+    timeout: ?*const std.c.timespec,
+) c_int {
+    if (!builtin.os.tag.isDarwin()) {
+        return std.c.kevent(kq, changelist, nchanges, eventlist, nevents, timeout);
+    }
+    const immediate = if (timeout) |t| t.sec == 0 and t.nsec == 0 else false;
+    return std.c.kevent64(
+        kq,
+        @ptrCast(changelist),
+        nchanges,
+        @ptrCast(eventlist),
+        nevents,
+        .{ .IMMEDIATE = immediate },
+        if (immediate) null else timeout,
+    );
+}
+
 const delete_marker: usize = std.math.maxInt(usize);
 
 // udata tag marking a kevent that belongs to the single-owner socket path, so
@@ -235,8 +281,8 @@ shared: *SharedState = undefined,
 kqueue_fd: i32 = -1,
 waker_ident: usize = undefined,
 poll_queue: std.AutoHashMapUnmanaged(u64, PollEntry) = .empty,
-change_buffer: std.ArrayList(std.c.Kevent) = .empty,
-events: []std.c.Kevent,
+change_buffer: std.ArrayList(Kevent) = .empty,
+events: []Kevent,
 /// Currently-armed absolute deadline (ns in the boot epoch) for the boot
 /// EVFILT_TIMER, or null if disarmed. Darwin only.
 wall_armed: ?u64 = null,
@@ -256,17 +302,17 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
     };
     errdefer _ = std.c.close(kqueue_fd);
 
-    const events = try allocator.alloc(std.c.Kevent, queue_size);
+    const events = try allocator.alloc(Kevent, queue_size);
     errdefer allocator.free(events);
 
-    var change_buffer = try std.ArrayList(std.c.Kevent).initCapacity(allocator, queue_size);
+    var change_buffer = try std.ArrayList(Kevent).initCapacity(allocator, queue_size);
     errdefer change_buffer.deinit(allocator);
 
     // Use address of self as unique waker ident
     const waker_ident = @intFromPtr(self);
 
     // Register EVFILT_USER for wakeups
-    var changes: [1]std.c.Kevent = .{.{
+    var changes: [1]Kevent = .{.{
         .ident = waker_ident,
         .filter = EVFILT_USER,
         .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.CLEAR,
@@ -274,7 +320,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
         .data = 0,
         .udata = 0,
     }};
-    const rc = std.c.kevent(kqueue_fd, &changes, 1, &.{}, 0, null);
+    const rc = kevent(kqueue_fd, &changes, 1, &.{}, 0, null);
     switch (posix.errno(rc)) {
         .SUCCESS => {},
         else => |err| return unexpectedError(err),
@@ -304,7 +350,7 @@ pub fn deinit(self: *Self) void {
 
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
-    var changes: [1]std.c.Kevent = .{.{
+    var changes: [1]Kevent = .{.{
         .ident = self.waker_ident,
         .filter = EVFILT_USER,
         .flags = 0,
@@ -317,7 +363,7 @@ pub fn wake(self: *Self, state: *LoopState) void {
     // syscall. Retry EINTR; anything else means the waker is broken and
     // every subsequent wake would be lost, so fail loudly.
     while (true) {
-        const rc = std.c.kevent(self.kqueue_fd, &changes, 1, &.{}, 0, null);
+        const rc = kevent(self.kqueue_fd, &changes, 1, &.{}, 0, null);
         switch (posix.errno(rc)) {
             .SUCCESS => return,
             .INTR => continue,
@@ -458,7 +504,7 @@ fn getFflags(completion: *Completion) u32 {
     };
 }
 
-fn reserveChange(self: *Self) !*std.c.Kevent {
+fn reserveChange(self: *Self) !*Kevent {
     return self.change_buffer.addOne(self.allocator);
 }
 
@@ -581,7 +627,7 @@ pub fn unregisterCleanup(self: *Self, fd: NetHandle) void {
 }
 
 /// A no-error event for the optimistic (pre-park) checkCompletion attempt.
-pub fn probeEvent(fd: NetHandle, dir: sockreg.Dir) std.c.Kevent {
+pub fn probeEvent(fd: NetHandle, dir: sockreg.Dir) Kevent {
     return .{
         .ident = @intCast(fd),
         .filter = filterForDir(dir),
@@ -764,7 +810,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
     } else null;
 
     const changes = self.change_buffer.items;
-    const rc = std.c.kevent(
+    const rc = kevent(
         self.kqueue_fd,
         changes.ptr,
         @intCast(changes.len),
@@ -852,7 +898,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
 
 const CheckResult = enum { completed, requeue };
 
-fn handleKqueueError(event: *const std.c.Kevent, comptime errnoToError: fn (net.E) anyerror) ?anyerror {
+fn handleKqueueError(event: *const Kevent, comptime errnoToError: fn (net.E) anyerror) ?anyerror {
     const has_error = (event.flags & EV_ERROR) != 0;
     const has_eof = (event.flags & EV_EOF) != 0;
     if (!has_error and !has_eof) return null;
@@ -869,7 +915,7 @@ fn handleKqueueError(event: *const std.c.Kevent, comptime errnoToError: fn (net.
     return errnoToError(@fromBackingInt(@intCast(sock_err)));
 }
 
-pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResult {
+pub fn checkCompletion(comp: *Completion, event: *const Kevent) CheckResult {
     switch (comp.op) {
         .net_connect => {
             if (handleKqueueError(event, net.errnoToConnectError)) |err| {
