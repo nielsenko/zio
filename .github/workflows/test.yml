@@ -127,6 +127,37 @@ jobs:
       env:
         TEST_VERBOSE: 2
 
+  # Rings that threads share are a compile-time choice too. Only that build
+  # runs the tests of a host that ticks from a different thread each time.
+  io_uring_shared:
+    strategy:
+      fail-fast: false
+      matrix:
+        zig_version: ['0.17.0']
+        mode: [debug, release]
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ matrix.zig_version }}
+
+    - name: Build and test
+      shell: bash
+      run: |
+        for backend in linux io_uring; do
+          ./check.sh --full --backend $backend --io-uring-shared \
+            ${{ matrix.mode == 'release' && '--release' || '' }}
+        done
+      timeout-minutes: 15
+      env:
+        TEST_VERBOSE: 2
+
   # The scheduling discipline is a compile-time choice, so the pinned and
   # single-executor paths are only covered by building against them.
   scheduling:

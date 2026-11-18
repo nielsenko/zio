@@ -25,6 +25,7 @@ const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const time = @import("../os/time.zig");
 const net = @import("../os/net.zig");
 const common = @import("backends/common.zig");
+const sockreg = @import("sockreg.zig");
 
 const log = @import("../common.zig").log;
 
@@ -138,6 +139,10 @@ pub const LoopGroup = struct {
     shared: Backend.SharedState = .{},
     /// Loops initialized with this group and not yet deinitialized.
     loops: std.atomic.Value(u32) = .init(0),
+    /// Allocates what the group's loops share, such as the socket table of
+    /// the kqueue and epoll backends. The loop that joins first may leave
+    /// before the others, so the group owns it, not a loop.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
 fn timerDeadlineLess(_: void, a: *Timer, b: *Timer) bool {
@@ -258,6 +263,8 @@ pub const LoopState = struct {
     /// on this loop's thread (added in `cancelLocal`, swept in `tick`, removed as
     /// the completion is finalized in the `work_completions` drain).
     cancel_resend: ?*Work = null,
+    /// `cancel_resend != null`, for `Loop.nextTimerDeadline` on other threads.
+    resend_pending: std.atomic.Value(bool) = .init(false),
     // TODO: Linked timers optimization
     // Instead of mutex-protected cross-thread timer cancellation, link timers to their
     // associated operations. When an operation completes, its linked timer is cleared
@@ -287,8 +294,9 @@ pub const LoopState = struct {
     pub const wake_loop: u32 = 1;
     pub const wake_async: u32 = 2;
     pub const wake_cancel: u32 = 4;
-    /// Set by the loop just before a blocking backend poll. The top bit,
-    /// apart from the request bits below it.
+    /// Set by the loop just before a blocking backend poll, and by
+    /// `Loop.prepareHostWait`. The top bit, apart from the request bits
+    /// below it.
     pub const sleeping: u32 = 1 << 31;
     const wake_mask: u32 = wake_loop | wake_async | wake_cancel;
 
@@ -457,6 +465,7 @@ pub const LoopState = struct {
         work.resend_key = key;
         work.resend_next = self.cancel_resend;
         self.cancel_resend = work;
+        self.resend_pending.store(true, .release);
     }
 
     /// Remove the work owning `completion` from the resend list, if it is on it.
@@ -471,6 +480,7 @@ pub const LoopState = struct {
                 slot.* = node.resend_next;
                 node.resend_next = null;
                 node.resend_key = null;
+                self.resend_pending.store(self.cancel_resend != null, .release);
                 return;
             }
             slot = &node.resend_next;
@@ -480,6 +490,8 @@ pub const LoopState = struct {
     /// Re-send `SIGURG` to every still-blocked canceling worker, dropping any
     /// that have acknowledged. Called once per `tick`. Loop-thread only.
     fn sweepResend(self: *LoopState) void {
+        if (self.cancel_resend == null) return;
+        defer self.resend_pending.store(self.cancel_resend != null, .release);
         var slot = &self.cancel_resend;
         while (slot.*) |node| {
             if (node.cancel_token.?.signal()) {
@@ -555,6 +567,7 @@ pub const Loop = struct {
         if (options.loop_group) |group| {
             self.loop_group = group;
         } else {
+            self.internal_loop_group.allocator = options.allocator;
             self.loop_group = &self.internal_loop_group;
         }
 
@@ -571,6 +584,9 @@ pub const Loop = struct {
             @panic("zio: .single_executor scheduling allows only one loop per LoopGroup");
         }
         errdefer _ = self.loop_group.loops.fetchSub(1, .monotonic);
+
+        if (has_sock_table) Backend.sockTable(&self.loop_group.shared).acquire(self.loop_group.allocator);
+        errdefer if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
 
         try self.backend.init(
             options.allocator,
@@ -594,9 +610,36 @@ pub const Loop = struct {
         while (c) |completion| : (c = completion.next) {
             disarmAsync(completion.cast(Async));
         }
+        if (has_sock_table) sockreg.leave(Backend.sockTable(&self.loop_group.shared), self, Backend.registerSocketOn);
         self.backend.deinit();
+        if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
         _ = self.loop_group.loops.fetchSub(1, .monotonic);
     }
+
+    /// Whether the next poll has work that needs no wait.
+    pub fn hasPendingWork(self: *const Loop) bool {
+        return !self.state.completions.empty() or
+            !self.state.work_completions.empty() or
+            self.cancel_queue.load(.acquire) != null or
+            self.backend.hasPendingChanges();
+    }
+
+    /// Makes the calling thread the loop's owner for the debug-only
+    /// ownership checks.
+    pub fn adoptThread(self: *Loop) void {
+        if (in_debug_mode) current_loop = self;
+    }
+
+    /// Ends the calling thread's ownership. Asserts it is the owner.
+    pub fn releaseThread(self: *Loop) void {
+        self.assertOwnThread();
+        if (in_debug_mode) current_loop = null;
+    }
+
+    /// Whether the backend keeps a socket table that the loops of a group
+    /// share, see sockreg.zig. A loop acquires it with the group's
+    /// allocator.
+    const has_sock_table = @hasDecl(Backend, "sockTable");
 
     /// Debug-only: assert we're on the thread that owns this loop.
     inline fn assertOwnThread(self: *const Loop) void {
@@ -645,10 +688,82 @@ pub const Loop = struct {
         return self.state.now[0];
     }
 
+    /// Refreshes the snapshot that `now` returns. `poll` does it around
+    /// its own wait.
+    pub fn updateNow(self: *Loop) void {
+        self.assertOwnThread();
+        self.state.updateNow();
+    }
+
     /// Wake up the loop from another thread (thread-safe). Costs a syscall
     /// only when the loop is sleeping in its poll and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
         if (self.state.requestWake(LoopState.wake_loop)) self.backend.wake(&self.state);
+    }
+
+    /// A descriptor that is readable when the loop has events, for a host
+    /// to wait on between ticks. Null on a backend that has none. The host
+    /// must not read from it.
+    ///
+    /// On IOCP it is the completion port. The host posts each entry it
+    /// dequeues back with `PostQueuedCompletionStatus`, and waits
+    /// alertably, since a `wake` arrives as an APC.
+    pub fn hostHandle(self: *const Loop) ?net.fd_t {
+        return self.backend.hostHandle();
+    }
+
+    /// Sends cross-thread wakes to the calling thread. Only IOCP wakes a
+    /// thread, and this does nothing elsewhere. Assumes no other thread
+    /// calls it at the same time.
+    pub fn adoptWakeThread(self: *Loop) void {
+        self.backend.adoptWakeThread();
+    }
+
+    /// The wake target `borrowWakeThread` replaced. Only IOCP has one.
+    const WakeLoan = if (@hasDecl(Backend, "WakeLoan")) Backend.WakeLoan else void;
+    const no_wake_loan: WakeLoan = if (WakeLoan == void) {} else null;
+
+    /// `adoptWakeThread` until `returnWakeThread`.
+    fn borrowWakeThread(self: *Loop) WakeLoan {
+        if (WakeLoan == void) return {};
+        return self.backend.borrowWakeThread();
+    }
+
+    fn returnWakeThread(self: *Loop, loan: WakeLoan) void {
+        if (WakeLoan == void) return;
+        self.backend.returnWakeThread(loan);
+    }
+
+    /// Announces a wait on `hostHandle`. Until the next poll, a `wake`
+    /// makes the handle readable. Returns false when a wake came in since
+    /// the last poll, and the host ticks instead of waiting. Assumes no
+    /// poll runs at the same time.
+    pub fn prepareHostWait(self: *Loop) bool {
+        return self.state.wake_requested.fetchOr(LoopState.sleeping, .acq_rel) & LoopState.wake_mask == 0;
+    }
+
+    /// How long a host may wait before it ticks again, or null when
+    /// nothing is pending. Capped like the loop's own wait, by
+    /// `wall_clock_cap` and, while a canceled thread-pool operation is
+    /// still blocked, by `resend_interval`. Thread-safe.
+    pub fn nextTimerDeadline(self: *Loop) ?Duration {
+        var next: ?Duration = if (self.state.resend_pending.load(.acquire)) resend_interval else null;
+        self.state.lockTimers();
+        defer self.state.unlockTimers();
+        for (0..wall_clock_count) |idx| {
+            const timer = self.state.timers[idx].peek() orelse continue;
+            const clock = indexClock(idx);
+            const current = time.now(clock);
+            var remaining = if (timer.deadline.value > current.value)
+                current.durationTo(timer.deadline)
+            else
+                Duration.zero;
+            if (clock != .awake and remaining.value > self.wall_clock_cap.value) {
+                remaining = self.wall_clock_cap;
+            }
+            if (next == null or remaining.value < next.?.value) next = remaining;
+        }
+        return next;
     }
 
     /// Wake up the loop to process async handles (thread-safe)
@@ -1536,7 +1651,16 @@ pub const Loop = struct {
 
         // Skip the backend poll when not waiting and there's nothing to retrieve.
         // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.backend.hasInflight();
+        // A host that waits on `hostHandle` needs queued registrations in
+        // the kernel first. After an announced wait a wake may sit in the
+        // backend, and polling takes it, so the handle goes quiet.
+        const host_waited = self.state.wake_requested.load(.acquire) & LoopState.sleeping != 0;
+        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges() or host_waited;
+        // IOCP wakes a thread, and the host may have pointed the wakes at
+        // another one. Take them before announcing the sleep. A wake after
+        // the poll leaves a request that `prepareHostWait` sees.
+        const wake_loan = if (should_poll and timeout.value != 0) self.borrowWakeThread() else no_wake_loan;
+        defer self.returnWakeThread(wake_loan);
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.
@@ -1577,4 +1701,56 @@ pub const Loop = struct {
 
 test {
     _ = @import("tests.zig");
+}
+
+test "Loop.nextTimerDeadline: a canceled worker still blocked bounds the host's wait" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    try std.testing.expectEqual(null, loop.nextTimerDeadline());
+
+    const Noop = struct {
+        fn run(_: *Work) void {}
+    };
+    var work: Work = .init(Noop.run, null);
+    loop.state.addResend(&work, &work.c);
+    try std.testing.expect(loop.nextTimerDeadline().?.value <= resend_interval.value);
+
+    loop.state.removeResendByCompletion(&work.c);
+    try std.testing.expectEqual(null, loop.nextTimerDeadline());
+}
+
+test "Loop.nextTimerDeadline: a far real-clock timer bounds the host's wait by the wall clock cap" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    var timer: Timer = .initClock(.none, .real);
+    loop.setTimer(&timer, .{ .duration = .fromSeconds(600) });
+    defer _ = loop.clearTimer(&timer);
+    try std.testing.expect(loop.nextTimerDeadline().?.value <= loop.wall_clock_cap.value);
+}
+
+test "LoopGroup: loops join and leave a group from two threads at once" {
+    if (builtin.single_threaded or single_owner) return error.SkipZigTest;
+
+    const Churn = struct {
+        fn run(group: *LoopGroup, failures: *std.atomic.Value(u32)) void {
+            for (0..500) |_| {
+                var loop: Loop = undefined;
+                loop.init(.{ .loop_group = group }) catch {
+                    _ = failures.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                loop.deinit();
+            }
+        }
+    };
+    var group: LoopGroup = .{};
+    var failures = std.atomic.Value(u32).init(0);
+    const a = try std.Thread.spawn(.{}, Churn.run, .{ &group, &failures });
+    const b = try std.Thread.spawn(.{}, Churn.run, .{ &group, &failures });
+    a.join();
+    b.join();
+    try std.testing.expectEqual(0, failures.load(.monotonic));
 }

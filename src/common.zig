@@ -890,8 +890,18 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
     var group = ev.Group.init(.race);
     var timer = ev.Timer.initClock(timeout, clock);
 
-    group.add(c);
+    // Both members finish in place. Deferred, an operation the backend
+    // completes at submit would finish at the next poll, and the timer's
+    // cancel at the one after. The group reports the result, and a callback
+    // the caller left would run inside loop.add.
+    c.callback = null;
+    c.flags = .{ .defer_callback = false };
+    timer.c.flags = .{ .defer_callback = false };
+
+    // A group submits its last-added member first, and the operation has to
+    // go before the timer.
     group.add(&timer.c);
+    group.add(c);
 
     waitForIo(&group.c) catch |err| {
         // Canceled before the group was submitted: the operation never ran.
