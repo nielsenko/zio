@@ -53,7 +53,7 @@ A tick ends the announcement. A host that ticks while it is already waiting, for
 
 ### Backends Without a Descriptor
 
-`hostHandle()` is null on the poll, IOCP and io_uring backends. An io_uring ring is set up with `DEFER_TASKRUN`, which holds its completions until its own thread enters the kernel, so a wait elsewhere would not see them.
+`hostHandle()` is null on the poll and IOCP backends. It is also null on io_uring unless zio is built with `-Dio_uring_single_issuer=false`. A ring set up with `DEFER_TASKRUN` holds its completions until its own thread enters the kernel, so a wait elsewhere would not see them.
 
 Without a descriptor, the host lets the tick wait in the loop's own poll, with a cap that suits it, as the example does with `tick(.fromMilliseconds(100))`.
 
