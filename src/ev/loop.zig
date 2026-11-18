@@ -289,8 +289,9 @@ pub const LoopState = struct {
     pub const wake_loop: u32 = 1;
     pub const wake_async: u32 = 2;
     pub const wake_cancel: u32 = 4;
-    /// Set by the loop just before a blocking backend poll. The top bit,
-    /// apart from the request bits below it.
+    /// Set by the loop just before a blocking backend poll, and by
+    /// `Loop.prepareHostWait`. The top bit, apart from the request bits
+    /// below it.
     pub const sleeping: u32 = 1 << 31;
     const wake_mask: u32 = wake_loop | wake_async | wake_cancel;
 
@@ -677,6 +678,14 @@ pub const Loop = struct {
     /// must not read from it.
     pub fn hostHandle(self: *const Loop) ?net.fd_t {
         return self.backend.hostHandle();
+    }
+
+    /// Announces a wait on `hostHandle`. Until the next poll, a `wake`
+    /// makes the handle readable. Returns false when a wake came in since
+    /// the last poll, and the host ticks instead of waiting. Assumes no
+    /// poll runs at the same time.
+    pub fn prepareHostWait(self: *Loop) bool {
+        return self.state.wake_requested.fetchOr(LoopState.sleeping, .acq_rel) & LoopState.wake_mask == 0;
     }
 
     /// How long a host may wait before it ticks again, or null when
@@ -1589,8 +1598,10 @@ pub const Loop = struct {
         // Skip the backend poll when not waiting and there's nothing to retrieve.
         // This avoids syscall overhead for pure CPU-bound workloads.
         // A host that waits on `hostHandle` needs queued registrations in
-        // the kernel first.
-        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges();
+        // the kernel first. After an announced wait a wake may sit in the
+        // backend, and polling takes it, so the handle goes quiet.
+        const host_waited = self.state.wake_requested.load(.acquire) & LoopState.sleeping != 0;
+        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges() or host_waited;
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.
