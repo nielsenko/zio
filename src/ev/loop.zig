@@ -258,6 +258,8 @@ pub const LoopState = struct {
     /// on this loop's thread (added in `cancelLocal`, swept in `tick`, removed as
     /// the completion is finalized in the `work_completions` drain).
     cancel_resend: ?*Work = null,
+    /// `cancel_resend != null`, for `Loop.nextTimerDeadline` on other threads.
+    resend_pending: std.atomic.Value(bool) = .init(false),
     // TODO: Linked timers optimization
     // Instead of mutex-protected cross-thread timer cancellation, link timers to their
     // associated operations. When an operation completes, its linked timer is cleared
@@ -461,6 +463,7 @@ pub const LoopState = struct {
         work.resend_key = key;
         work.resend_next = self.cancel_resend;
         self.cancel_resend = work;
+        self.resend_pending.store(true, .release);
     }
 
     /// Remove the work owning `completion` from the resend list, if it is on it.
@@ -475,6 +478,7 @@ pub const LoopState = struct {
                 slot.* = node.resend_next;
                 node.resend_next = null;
                 node.resend_key = null;
+                self.resend_pending.store(self.cancel_resend != null, .release);
                 return;
             }
             slot = &node.resend_next;
@@ -484,6 +488,8 @@ pub const LoopState = struct {
     /// Re-send `SIGURG` to every still-blocked canceling worker, dropping any
     /// that have acknowledged. Called once per `tick`. Loop-thread only.
     fn sweepResend(self: *LoopState) void {
+        if (self.cancel_resend == null) return;
+        defer self.resend_pending.store(self.cancel_resend != null, .release);
         var slot = &self.cancel_resend;
         while (slot.*) |node| {
             if (node.cancel_token.?.signal()) {
@@ -602,6 +608,15 @@ pub const Loop = struct {
         _ = self.loop_group.loops.fetchSub(1, .monotonic);
     }
 
+    /// Whether the next poll has work that needs no wait.
+    pub fn hasPendingWork(self: *const Loop) bool {
+        return !self.state.completions.empty() or
+            !self.state.work_completions.empty() or
+            !self.state.dispatched.empty() or
+            self.cancel_queue.load(.acquire) != null or
+            self.backend.hasPendingChanges();
+    }
+
     /// Debug-only: assert we're on the thread that owns this loop.
     inline fn assertOwnThread(self: *const Loop) void {
         if (in_debug_mode) std.debug.assert(current_loop == self);
@@ -659,10 +674,48 @@ pub const Loop = struct {
         return self.state.now[0];
     }
 
+    /// Refreshes the snapshot that `now` returns. `poll` does it around
+    /// its own wait.
+    pub fn updateNow(self: *Loop) void {
+        self.assertOwnThread();
+        self.state.updateNow();
+    }
+
     /// Wake up the loop from another thread (thread-safe). Costs a syscall
     /// only when the loop is sleeping in its poll and nobody has woken it yet.
     pub fn wake(self: *Loop) void {
         if (self.state.requestWake(LoopState.wake_loop)) self.backend.wake(&self.state);
+    }
+
+    /// A descriptor that is readable when the loop has events, for a host
+    /// to wait on between ticks. Null on a backend that has none. The host
+    /// must not read from it.
+    pub fn hostHandle(self: *const Loop) ?net.fd_t {
+        return self.backend.hostHandle();
+    }
+
+    /// How long a host may wait before it ticks again, or null when
+    /// nothing is pending. Capped like the loop's own wait, by
+    /// `wall_clock_cap` and, while a canceled thread-pool operation is
+    /// still blocked, by `resend_interval`. Thread-safe.
+    pub fn nextTimerDeadline(self: *Loop) ?Duration {
+        var next: ?Duration = if (self.state.resend_pending.load(.acquire)) resend_interval else null;
+        self.state.lockTimers();
+        defer self.state.unlockTimers();
+        for (0..wall_clock_count) |idx| {
+            const timer = self.state.timers[idx].peek() orelse continue;
+            const clock = indexClock(idx);
+            const current = time.now(clock);
+            var remaining = if (timer.deadline.value > current.value)
+                current.durationTo(timer.deadline)
+            else
+                Duration.zero;
+            if (clock != .awake and remaining.value > self.wall_clock_cap.value) {
+                remaining = self.wall_clock_cap;
+            }
+            if (next == null or remaining.value < next.?.value) next = remaining;
+        }
+        return next;
     }
 
     /// Wake up the loop to process async handles (thread-safe)
@@ -1550,7 +1603,9 @@ pub const Loop = struct {
 
         // Skip the backend poll when not waiting and there's nothing to retrieve.
         // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.backend.hasInflight();
+        // A host that waits on `hostHandle` needs queued registrations in
+        // the kernel first.
+        const should_poll = wait or self.backend.hasInflight() or self.backend.hasPendingChanges();
         if (should_poll and timeout.value != 0) {
             // Announce the sleep, so wakers know a syscall is needed from
             // here on. A request that got in first means there is no sleep.
@@ -1591,4 +1646,32 @@ pub const Loop = struct {
 
 test {
     _ = @import("tests.zig");
+}
+
+test "Loop.nextTimerDeadline: a canceled worker still blocked bounds the host's wait" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+    try std.testing.expectEqual(null, loop.nextTimerDeadline());
+
+    const Noop = struct {
+        fn run(_: *Work) void {}
+    };
+    var work: Work = .init(Noop.run, null);
+    loop.state.addResend(&work, &work.c);
+    try std.testing.expect(loop.nextTimerDeadline().?.value <= resend_interval.value);
+
+    loop.state.removeResendByCompletion(&work.c);
+    try std.testing.expectEqual(null, loop.nextTimerDeadline());
+}
+
+test "Loop.nextTimerDeadline: a far real-clock timer bounds the host's wait by the wall clock cap" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    var timer: Timer = .initClock(.none, .real);
+    loop.setTimer(&timer, .{ .duration = .fromSeconds(600) });
+    defer _ = loop.clearTimer(&timer);
+    try std.testing.expect(loop.nextTimerDeadline().?.value <= loop.wall_clock_cap.value);
 }

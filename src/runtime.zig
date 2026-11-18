@@ -845,18 +845,22 @@ pub const Executor = struct {
         }
     }
 
-    pub const RunMode = enum {
+    pub const RunMode = union(enum) {
         /// Run until main_task.state becomes .ready.
         /// Caller must set up the state before calling (e.g., .waiting for I/O).
         until_ready,
         /// Run until explicitly stopped via loop.stop().
         /// Used for worker executor threads.
         until_stopped,
+        /// Run one pass and return, see `tick`. The poll waits at most this
+        /// long, and only when no task is ready.
+        once: Duration,
     };
 
     /// Run the executor event loop.
     pub fn run(self: *Executor, mode: RunMode) !void {
-        const check_ready = mode != .until_stopped;
+        // In a `once` run the main task is host code, ready all along.
+        const check_ready = mode == .until_ready;
 
         // The run loop is scheduler code, not a task: clear current_task so any I/O
         // it performs (a completion callback, std.log, a debug_io write) takes the
@@ -881,7 +885,9 @@ pub const Executor = struct {
 
         // Start the batch window here: time spent in the main task between
         // run() calls must not count toward the per-quantum estimate.
-        self.tick_started_at = Timestamp.now(.monotonic);
+        // Tasks arm timeouts from the loop's snapshot, which is as stale.
+        self.loop.updateNow();
+        self.tick_started_at = self.loop.now();
 
         // The last park came back with nothing runnable, so the executor is
         // still idle. Whichever pass first finds work, or returns to the main
@@ -889,15 +895,7 @@ pub const Executor = struct {
         var still_idle: bool = false;
 
         while (true) {
-            // Process ready coroutines
-            while (self.getNextTask()) |next_task| {
-                updateParentContext(next_task, &self.main_task.coro.context);
-                self.current_task = next_task;
-                self.spawn_streak = 0;
-                next_task.coro.step();
-                self.current_task = null;
-                self.processCleanup();
-            }
+            self.drainReady();
 
             // Quanta spent this cycle mean tasks ran here: a busy executor
             // can't watch for stuck tasks, so it gives up the rescue baton.
@@ -921,9 +919,26 @@ pub const Executor = struct {
                 }
                 try self.loop.poll(.zero);
                 self.drainDispatched();
-            } else {
-                still_idle = try self.parkAndSearch(check_ready);
-                if (!still_idle) self.leaveIdle();
+            } else switch (mode) {
+                .once => |wait_cap| {
+                    try self.loop.poll(wait_cap);
+                    self.drainDispatched();
+                },
+                .until_ready, .until_stopped => {
+                    still_idle = try self.parkAndSearch(check_ready);
+                    if (!still_idle) self.leaveIdle();
+                },
+            }
+
+            // Run what the poll readied before the host gets control back.
+            // Left for the next call, each wake-up of the host costs two.
+            if (mode == .once) {
+                var ran = false;
+                while (self.tickBudgetLeft() and self.checkLocalWork(false)) : (ran = true) {
+                    self.drainReady();
+                }
+                // The retune below reads the snapshot.
+                if (ran) self.loop.updateNow();
             }
 
             // Retune the tick budget from this batch. Skipped when we may have
@@ -952,11 +967,43 @@ pub const Executor = struct {
                 continue;
             }
 
+            if (mode == .once) return;
+
             // Check again after I/O
             if (check_ready and self.main_task.state.load(.acquire).tag == .ready) {
                 if (still_idle) self.leaveIdle();
                 return;
             }
+        }
+    }
+
+    /// One pass of the run loop, for a host that drives the executor from
+    /// its own event loop. It is `run` with `RunMode.once`, see
+    /// docs/host-loop.md. Returns whether work is left that needs no wait,
+    /// and the host then calls again before it waits.
+    ///
+    /// Returns `error.AlreadyRunning` when one of this executor's tasks, or
+    /// its scheduler, is already on the calling thread's stack, as under a
+    /// modal loop that pumps the host's events. Asserts the calling thread
+    /// is the executor's.
+    pub fn tick(self: *Executor, wait_cap: Duration) !bool {
+        assert(getCurrentExecutorOrNull() == self);
+        if (self.current_task != &self.main_task) return error.AlreadyRunning;
+        try self.run(.{ .once = wait_cap });
+        return !self.run_queue.isEmpty() or
+            !self.run_queue.overflow.isEmpty() or
+            self.loop.hasPendingWork();
+    }
+
+    /// Runs ready tasks until none is left or the tick budget is spent.
+    fn drainReady(self: *Executor) void {
+        while (self.getNextTask()) |next_task| {
+            updateParentContext(next_task, &self.main_task.coro.context);
+            self.current_task = next_task;
+            self.spawn_streak = 0;
+            next_task.coro.step();
+            self.current_task = null;
+            self.processCleanup();
         }
     }
 
@@ -2557,6 +2604,239 @@ test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker"
 
     handle.cancel(); // requests cancellation and waits for completion
     try std.testing.expectError(error.Canceled, handle.getResult());
+}
+
+test "Executor.tick: a host drives a sleeping task to completion" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(done: *bool) !void {
+            try sleep(.fromMilliseconds(20));
+            done.* = true;
+        }
+    };
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{&done});
+    defer handle.cancel();
+
+    // Each tick waits at most 1ms, so the 20ms sleep takes several.
+    var ticks: usize = 0;
+    const start = Timestamp.now(.monotonic);
+    while (!done) : (ticks += 1) {
+        _ = try runtime.main_executor.tick(.fromMilliseconds(1));
+        try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 2000);
+    }
+    try std.testing.expect(ticks >= 2);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() >= 20);
+}
+
+test "Executor.tick: a zero wait returns at once with nothing ready" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const start = Timestamp.now(.monotonic);
+    const more = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!more);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 100);
+}
+
+test "Executor.tick: tasks the tick budget held back cut the wait short" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run() !void {
+            while (true) try yield();
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+
+    const start = Timestamp.now(.monotonic);
+    try std.testing.expect(try runtime.main_executor.tick(.fromSeconds(2)));
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+}
+
+test "Executor.tick: ready tasks run before the poll and after it" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Task = struct {
+        fn run(counter: *u32) void {
+            counter.* += 1;
+        }
+    };
+    var counter: u32 = 0;
+    var a = try runtime.spawn(Task.run, .{&counter});
+    defer a.cancel();
+    var b = try runtime.spawn(Task.run, .{&counter});
+    defer b.cancel();
+
+    _ = try runtime.main_executor.tick(.zero);
+
+    try std.testing.expectEqual(2, counter);
+}
+
+test "Executor.tick: a busy ring still takes what other threads woke, up to the tick budget" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const Parked = struct {
+        fn run(event: *Event, woken: *u32) void {
+            event.wait() catch return;
+            woken.* += 1;
+        }
+    };
+    const Task = struct {
+        fn run() void {}
+    };
+    var event = Event.init;
+    var woken: u32 = 0;
+    var waiters: [32]JoinHandle(void) = undefined;
+    for (&waiters) |*waiter| waiter.* = try runtime.spawn(Parked.run, .{ &event, &woken });
+    defer for (&waiters) |*waiter| waiter.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    // The wakes of a thread outside the runtime go to the overflow queue.
+    const setter = try std.Thread.spawn(.{}, Event.set, .{&event});
+    setter.join();
+    // A task in the ring when the tick starts makes it busy.
+    var busy = try runtime.spawn(Task.run, .{});
+    defer busy.cancel();
+    // `run` retuned the budget while the waiters started, to a few tasks on
+    // a slow machine, and the test needs room for all of them.
+    comptime std.debug.assert(Executor.initial_tick_budget > waiters.len);
+    runtime.main_executor.tick_task_budget = Executor.initial_tick_budget;
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expectEqual(waiters.len, woken);
+}
+
+test "Executor.tick: a timeout armed before the poll counts from the tick, not from the host's wait" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const Task = struct {
+        fn run() !void {
+            var timer = ev.Timer.init(.{ .duration = .fromSeconds(10) });
+            try common.timedWaitForIo(&timer.c, .fromMilliseconds(500));
+        }
+    };
+    // The host waits in its own loop, longer than the timeout.
+    os.time.sleep(.fromMilliseconds(600));
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+
+    _ = try runtime.main_executor.tick(.zero);
+    try std.testing.expect(!handle.hasResult());
+}
+
+test "Executor.tick: an operation that finishes inside loop.add cuts the wait short" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const Task = struct {
+        fn run(opened: *bool) !void {
+            // Every backend opens a socket inside `loop.add`. The task
+            // parks with its wake already handed out.
+            const socket = try net.Socket.open(.stream, .ipv4, .ip);
+            opened.* = true;
+            socket.close();
+        }
+    };
+    var opened = false;
+    var handle = try runtime.spawn(Task.run, .{&opened});
+    defer handle.cancel();
+
+    const start = Timestamp.now(.monotonic);
+    _ = try runtime.main_executor.tick(.fromSeconds(2));
+    try std.testing.expect(opened);
+    try std.testing.expect(start.untilNow(.monotonic).toMilliseconds() < 1000);
+}
+
+test "Executor.tick: a task another thread wakes during the poll runs in the same tick" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const Task = struct {
+        fn run(event: *Event, done: *bool) !void {
+            try event.wait();
+            done.* = true;
+        }
+    };
+    const Setter = struct {
+        fn run(event: *Event) void {
+            os.time.sleep(.fromMilliseconds(50));
+            event.set();
+        }
+    };
+    var event = Event.init;
+    var done = false;
+    var handle = try runtime.spawn(Task.run, .{ &event, &done });
+    defer handle.cancel();
+    while (try runtime.main_executor.tick(.zero)) {}
+
+    const setter = try std.Thread.spawn(.{}, Setter.run, .{&event});
+    defer setter.join();
+    _ = try runtime.main_executor.tick(.fromSeconds(2));
+    try std.testing.expect(done);
+}
+
+test "Executor.tick: a tick from inside one of the executor's own tasks fails" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Other = struct {
+        fn run(ran: *bool) void {
+            ran.* = true;
+        }
+    };
+    const Task = struct {
+        fn run(rt: *Runtime, ran: *bool) !void {
+            var other = try rt.spawn(Other.run, .{ran});
+            defer other.cancel();
+            const task = getCurrentTask();
+            try std.testing.expectError(error.AlreadyRunning, getCurrentExecutor().tick(.zero));
+            try std.testing.expectEqual(task, getCurrentTask());
+            try yield();
+            try std.testing.expect(ran.*);
+        }
+    };
+    var ran = false;
+    var handle = try runtime.spawn(Task.run, .{ runtime, &ran });
+    while (try runtime.main_executor.tick(.zero)) {}
+    try handle.join();
+}
+
+test "Loop: the host handle and the next timer deadline" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const loop = &runtime.main_executor.loop;
+
+    // The runtime may keep timers of its own, so the test claims only
+    // this. Once the sleep is armed, the next deadline is at most its 30ms.
+    const Task = struct {
+        fn run() !void {
+            try sleep(.fromMilliseconds(30));
+        }
+    };
+    var handle = try runtime.spawn(Task.run, .{});
+    defer handle.cancel();
+    _ = try runtime.main_executor.tick(.zero);
+
+    const deadline = loop.nextTimerDeadline().?;
+    try std.testing.expect(deadline.toMilliseconds() <= 30);
+    // A Windows handle is a SOCKET, and no Windows backend has one.
+    if (builtin.os.tag != .windows) {
+        if (loop.hostHandle()) |fd| try std.testing.expect(fd >= 0);
+    }
 }
 
 test "Runtime: implicit run" {
