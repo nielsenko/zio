@@ -49,8 +49,46 @@ const num_buckets = 1024;
 const bucket_shift = @bitSizeOf(usize) - @ctz(@as(usize, num_buckets));
 
 const Bucket = struct {
-    mutex: os.Mutex = .init(),
+    lock: BucketLock = .{},
     waiters: SimpleQueue(FutexWaiter) = .empty,
+};
+
+/// Guards a bucket's queue. Every critical section is a few pointer
+/// updates and never waits, so an uncontended lock is one compare-and-swap
+/// and an unlock one store, with no call into the OS mutex. A contended
+/// lock spins, then yields the thread so a preempted holder can finish.
+const BucketLock = struct {
+    state: std.atomic.Value(u32) = .init(unlocked),
+
+    const unlocked: u32 = 0;
+    const locked: u32 = 1;
+    const spins_before_yield = 64;
+
+    fn lock(self: *BucketLock) void {
+        if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+        self.lockContended();
+    }
+
+    fn lockContended(self: *BucketLock) void {
+        @branchHint(.cold);
+        var spins: u32 = 0;
+        while (true) {
+            if (self.state.load(.monotonic) == unlocked and
+                self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+            spins += 1;
+            if (spins < spins_before_yield) {
+                std.atomic.spinLoopHint();
+            } else {
+                os.thread.yield();
+                spins = 0;
+            }
+        }
+    }
+
+    fn unlock(self: *BucketLock) void {
+        std.debug.assert(self.state.load(.monotonic) == locked);
+        self.state.store(unlocked, .release);
+    }
 };
 
 /// Global static bucket table for futex operations.
@@ -86,18 +124,18 @@ pub fn wait(ptr: *const u32, expect: u32) Cancelable!void {
     };
 
     // Add to bucket under lock
-    bucket.mutex.lock();
+    bucket.lock.lock();
 
     // Double-check under lock to avoid lost wakeups
     if (@atomicLoad(u32, ptr, .monotonic) != expect) {
-        bucket.mutex.unlock();
+        bucket.lock.unlock();
         return;
     }
 
     // Add waiter to queue
     bucket.waiters.push(&futex_waiter);
 
-    bucket.mutex.unlock();
+    bucket.lock.unlock();
 
     // Wait for signal, handling spurious wakeups internally
     futex_waiter.waiter.wait(1, .allow_cancel) catch |err| {
@@ -149,7 +187,7 @@ pub const timedWait = waitTimeout;
 pub fn waitTimeoutClock(ptr: *const u32, expect: u32, timeout: Timeout, clock: Clock) (Timeoutable || Cancelable)!void {
     // No deadline: delegate to the untimed `wait`. This skips the timer setup
     // and, more importantly, the unconditional post-wake `removeFromBucket`
-    // below (a second bucket-mutex acquisition per wait) that can never observe
+    // below (a second bucket-lock acquisition per wait) that can never observe
     // a timeout when there is none. `wake()` dequeues us instead.
     if (timeout == .none) return wait(ptr, expect);
 
@@ -170,18 +208,18 @@ pub fn waitTimeoutClock(ptr: *const u32, expect: u32, timeout: Timeout, clock: C
     };
 
     // Add to bucket under lock
-    bucket.mutex.lock();
+    bucket.lock.lock();
 
     // Double-check under lock to avoid lost wakeups
     if (@atomicLoad(u32, ptr, .monotonic) != expect) {
-        bucket.mutex.unlock();
+        bucket.lock.unlock();
         return;
     }
 
     // Add waiter to queue
     bucket.waiters.push(&futex_waiter);
 
-    bucket.mutex.unlock();
+    bucket.lock.unlock();
 
     // Wait for signal or timeout, handling spurious wakeups internally
     futex_waiter.waiter.timedWaitClock(1, timeout, clock, .allow_cancel) catch |err| switch (err) {
@@ -210,8 +248,8 @@ pub const timedWaitClock = waitTimeoutClock;
 /// Remove a waiter from its bucket (for cancellation/timeout).
 /// Returns true if the waiter was in the queue, false if already removed by wake.
 fn removeFromBucket(bucket: *Bucket, waiter: *FutexWaiter) bool {
-    bucket.mutex.lock();
-    defer bucket.mutex.unlock();
+    bucket.lock.lock();
+    defer bucket.lock.unlock();
     return bucket.waiters.remove(waiter);
 }
 
@@ -222,7 +260,7 @@ pub fn wake(ptr: *const u32, max_waiters: u32) void {
     const address = @intFromPtr(ptr);
     const bucket = getBucket(address);
 
-    bucket.mutex.lock();
+    bucket.lock.lock();
 
     var local_stack: ?*FutexWaiter = null;
     var count: u32 = 0;
@@ -247,7 +285,7 @@ pub fn wake(ptr: *const u32, max_waiters: u32) void {
         node = next;
     }
 
-    bucket.mutex.unlock();
+    bucket.lock.unlock();
 
     // Wake all waiters outside lock to avoid holding lock during resume
     while (local_stack) |waiter| {
@@ -268,9 +306,9 @@ pub fn prepareWait(ptr: *const u32, node: *FutexWaiter, waiter: *Waiter) void {
     node.* = .{ .waiter = waiter, .address = address };
 
     const bucket = getBucket(address);
-    bucket.mutex.lock();
+    bucket.lock.lock();
     bucket.waiters.push(node);
-    bucket.mutex.unlock();
+    bucket.lock.unlock();
 }
 
 /// Cancel a `prepareWait()` registration.
