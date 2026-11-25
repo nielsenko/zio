@@ -474,6 +474,26 @@ fn futexWakeImpl(_: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
 }
 
 fn operateImpl(_: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    // Stream reads and writes skip operateInner, whose frame holds the
+    // locals of every operation and which each call would copy the
+    // operation into.
+    switch (operation) {
+        .net_read => |o| return .{ .net_read = result: {
+            break :result netReadOpImpl(o.socket_handle, o.data, o.control, .none, .awake) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => unreachable,
+                else => |e| break :result e,
+            };
+        } },
+        .net_write => |o| return .{ .net_write = result: {
+            break :result netWriteOpImpl(o.socket_handle, o.header, o.data, o.splat, .none, .awake) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Timeout => unreachable,
+                else => |e| break :result e,
+            };
+        } },
+        else => {},
+    }
     return operateInner(operation, .none, .awake) catch |err| switch (err) {
         error.Canceled => error.Canceled,
         error.Timeout => unreachable,
