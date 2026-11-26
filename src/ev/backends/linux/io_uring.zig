@@ -47,6 +47,7 @@ const NetBind = @import("../../completion.zig").NetBind;
 const NetListen = @import("../../completion.zig").NetListen;
 const NetConnect = @import("../../completion.zig").NetConnect;
 const NetAccept = @import("../../completion.zig").NetAccept;
+const NetRecvMulti = @import("../../completion.zig").NetRecvMulti;
 const NetRecv = @import("../../completion.zig").NetRecv;
 const NetSend = @import("../../completion.zig").NetSend;
 const NetRecvFrom = @import("../../completion.zig").NetRecvFrom;
@@ -97,6 +98,8 @@ pub const supports_recv_dontwait = true;
 
 pub fn capability(comptime op: Op) Support {
     return switch (op) {
+        // Needs the buffers of Loop.Options.recv_buffers.
+        .net_recv_multi => .maybe,
         // These opcodes postdate the minimum kernel accepted by ring setup and
         // are resolved from IORING_REGISTER_PROBE at runtime.
         .file_set_size, .process_wait => .maybe,
@@ -508,6 +511,10 @@ shared_state: *SharedState,
 /// when nothing can arrive.
 inflight: usize = 0,
 accept_hints: AcceptHints = .{},
+/// The provided buffer ring a multishot NetRecvMulti receives into, with
+/// the allocator of its memory. See initRecvBuffers.
+recv_buffers: ?linux.IoUring.BufferGroup = null,
+recv_buffers_gpa: std.mem.Allocator = undefined,
 
 pub fn init(self: *Self, _: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
@@ -580,6 +587,9 @@ pub fn supports(self: *const Self, comptime op: Op, _: *op.toType()) bool {
     if (comptime op == .process_wait) {
         return self.shared_state.waitid_support.load(.monotonic) == .yes;
     }
+    if (comptime op == .net_recv_multi) {
+        return self.recv_buffers != null;
+    }
     @compileError("unhandled runtime io_uring capability: " ++ @tagName(op));
 }
 
@@ -594,6 +604,7 @@ fn ringFromMasterFd(master_fd: i32, flags: u32, queue_size: u16) !linux.IoUring 
 }
 
 pub fn deinit(self: *Self) void {
+    if (self.recv_buffers) |*group| group.deinit(self.recv_buffers_gpa);
     _ = linux.close(self.waker_eventfd);
     const master_fd = self.shared_state.master_fd.load(.seq_cst);
     if (self.ring.fd == master_fd) {
@@ -608,6 +619,35 @@ pub fn deinit(self: *Self) void {
             _ = self.shared_state.master_fd.swap(-1, .seq_cst);
         }
     }
+}
+
+/// The group id of the provided buffer ring, unique in the ring.
+const recv_buffer_group: u16 = 1;
+
+/// Registers `count` buffers of `size` bytes as the ring a multishot
+/// NetRecvMulti receives into. error.Unsupported before Linux 6.0, which
+/// added the multishot receive.
+pub fn initRecvBuffers(self: *Self, gpa: std.mem.Allocator, count: u16, size: u32) !void {
+    if (!kernelAtLeast(6, 0)) return error.Unsupported;
+    self.recv_buffers = try linux.IoUring.BufferGroup.init(&self.ring, gpa, recv_buffer_group, size, count);
+    self.recv_buffers_gpa = gpa;
+}
+
+/// Whether initRecvBuffers set up the buffer ring.
+pub fn hasRecvBuffers(self: *const Self) bool {
+    return self.recv_buffers != null;
+}
+
+fn kernelAtLeast(major: u32, minor: u32) bool {
+    var uts: linux.utsname = undefined;
+    if (linux.errno(linux.uname(&uts)) != .SUCCESS) return false;
+    const release = std.mem.sliceTo(&uts.release, 0);
+    var parts = std.mem.splitScalar(u8, release, '.');
+    const have_major = std.fmt.parseInt(u32, parts.next() orelse return false, 10) catch return false;
+    const minor_text = parts.next() orelse return false;
+    const minor_end = std.mem.indexOfNone(u8, minor_text, "0123456789") orelse minor_text.len;
+    const have_minor = std.fmt.parseInt(u32, minor_text[0..minor_end], 10) catch return false;
+    return have_major > major or (have_major == major and have_minor >= minor);
 }
 
 /// See `Loop.hostHandle`. Null for a `DEFER_TASKRUN` ring, which holds
@@ -806,6 +846,15 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 sqe.prep_recvmsg(data.handle, &data.internal.msg, recvFlagsToMsg(data.flags));
                 sqe.ioprio |= recvPollFirst(data.flags);
             }
+            sqe.user_data = @intFromPtr(c);
+        },
+        .net_recv_multi => {
+            const data = c.cast(NetRecvMulti);
+            const sqe = self.getSqeOrDefer(c) orelse return;
+            sqe.prep_rw(.RECV, data.handle, 0, 0, 0);
+            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+            sqe.buf_index = recv_buffer_group;
+            sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
             sqe.user_data = @intFromPtr(c);
         },
         .net_send => {
@@ -1650,6 +1699,12 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             continue;
         }
 
+        // A multishot receive: every CQE but the last hands over a chunk.
+        if (completion.op == .net_recv_multi) {
+            self.netRecvMultiCqe(state, completion, cqe);
+            continue;
+        }
+
         // Store the result in the completion
         switch (completion.op) {
             .net_recvmmsg => storeRecvMmsgResult(completion, cqe.res, cqe.flags),
@@ -1674,6 +1729,34 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
     // A fired wall timer is reported as a timeout so the loop re-runs
     // checkTimers and fires the due boot/real timers.
     return wall_fired;
+}
+
+/// One CQE of a multishot NetRecvMulti. A chunk goes to `on_data` and its
+/// buffer back to the ring. The receive stays armed while the kernel sets
+/// IORING_CQE_F_MORE, and is armed again when the kernel ended it for want
+/// of buffers or room. The end of the stream, an error or a cancel finishes
+/// the completion.
+fn netRecvMultiCqe(self: *Self, state: *LoopState, c: *Completion, cqe: linux.io_uring_cqe) void {
+    const data = c.cast(NetRecvMulti);
+    const group = &self.recv_buffers.?;
+    if (cqe.res > 0) {
+        // A positive result always selected a buffer.
+        const bytes = group.get(cqe) catch unreachable;
+        data.on_data(data, bytes);
+        group.put(cqe) catch unreachable;
+        if (cqe.flags & linux.IORING_CQE_F_MORE != 0) return;
+    } else if (cqe.res == 0) {
+        c.setResult(.net_recv_multi, {});
+        return state.markCompletedFromBackend(c);
+    } else if (cqe.res != -@as(i32, @backingInt(linux.E.NOBUFS))) {
+        c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-cqe.res))));
+        return state.markCompletedFromBackend(c);
+    }
+    if (c.loadState().cancel_requested) {
+        c.setError(error.Canceled);
+        return state.markCompletedFromBackend(c);
+    }
+    self.resubmit(state, c);
 }
 
 fn drainPending(self: *Self, state: *LoopState) void {
@@ -1745,6 +1828,14 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
         .net_recv, .net_send, .net_accept, .file_read, .file_write => unreachable, // storeResult
         .group, .timer, .async, .work => unreachable,
         .net_open => unreachable,
+        // Reached from drainPending's cancel path. CQEs go to netRecvMultiCqe.
+        .net_recv_multi => {
+            if (res < 0) {
+                c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
+            } else {
+                c.setResult(.net_recv_multi, {});
+            }
+        },
         // Reached from drainPending's cancel path; CQEs take the reap loop's
         // own call to these.
         .net_recvmmsg => storeRecvMmsgResult(c, res, 0),

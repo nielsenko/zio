@@ -66,6 +66,7 @@ pub const supports_recvmmsg = builtin.os.tag == .freebsd or builtin.os.tag == .n
 
 pub fn capability(comptime op: Op) Support {
     return switch (op) {
+        .net_recv_multi => .no,
         .file_read_streaming, .file_write_streaming => .maybe,
         // FreeBSD's sendfile is asynchronous with respect to file reads. The
         // Darwin implementation can block the loop and deliberately falls back.
@@ -704,6 +705,7 @@ pub fn submit(self: *Self, state: *LoopState, comptime op: Op, c: *Completion) v
 
     switch (op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
+        .net_recv_multi => unreachable, // The loop's fallback, see capability
 
         // Synchronous operations - complete immediately
         .net_open => {

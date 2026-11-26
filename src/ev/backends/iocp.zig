@@ -185,6 +185,7 @@ pub const supports_recvmmsg = false;
 
 pub fn capability(comptime op: Op) Support {
     return switch (op) {
+        .net_recv_multi => .no,
         // Streaming read/write uses overlapped ReadFile/WriteFile on handles zio
         // opened and associated with the port: at offset zero for non-seekable
         // ones, at the file position for files. Other handles use the thread pool.
@@ -685,6 +686,7 @@ pub fn submit(self: *Self, state: *LoopState, comptime op: Op, c: *Completion) v
 
     switch (op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
+        .net_recv_multi => unreachable, // The loop's fallback, see capability
 
         // Synchronous operations - complete immediately
         .net_open => {

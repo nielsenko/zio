@@ -37,6 +37,7 @@ pub const NetListen = completion.NetListen;
 pub const NetConnect = completion.NetConnect;
 pub const NetAccept = completion.NetAccept;
 pub const NetRecv = completion.NetRecv;
+pub const NetRecvMulti = completion.NetRecvMulti;
 pub const NetSend = completion.NetSend;
 pub const NetRecvFrom = completion.NetRecvFrom;
 pub const NetSendTo = completion.NetSendTo;

@@ -14,6 +14,7 @@ const PipeClose = @import("completion.zig").PipeClose;
 const NetClose = @import("completion.zig").NetClose;
 const NetShutdown = @import("completion.zig").NetShutdown;
 const NetRecv = @import("completion.zig").NetRecv;
+const NetRecvMulti = @import("completion.zig").NetRecvMulti;
 const NetSend = @import("completion.zig").NetSend;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const FileRead = @import("completion.zig").FileRead;
@@ -99,6 +100,7 @@ pub fn executeBlocking(c: *Completion) void {
         .net_close => handleNetClose(c),
         .net_shutdown => handleNetShutdown(c),
         .net_recv => handleNetRecv(c),
+        .net_recv_multi => handleNetRecvMulti(c),
         .net_send => handleNetSend(c),
         .net_recvfrom => handleNetRecvFrom(c),
         .net_sendto => handleNetSendTo(c),
@@ -297,6 +299,22 @@ fn handleNetShutdown(c: *Completion) void {
 }
 
 /// Helper to handle socket recv operation
+/// One blocking receive into `buffer` after another, each chunk to
+/// `on_data`, until the end of the stream or an error.
+fn handleNetRecvMulti(c: *Completion) void {
+    const data = c.cast(NetRecvMulti);
+    var iov = [1]os.iovec{os.iovecFromSlice(data.buffer)};
+    while (true) {
+        pollForReady(data.handle, os.net.POLL.IN) catch |err| return c.setError(err);
+        const n = os.net.recv(data.handle, &iov, .{}) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return c.setError(err),
+        };
+        if (n == 0) return c.setResult(.net_recv_multi, {});
+        data.on_data(data, data.buffer[0..n]);
+    }
+}
+
 fn handleNetRecv(c: *Completion) void {
     const data = c.cast(NetRecv);
 

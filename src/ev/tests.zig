@@ -32,6 +32,7 @@ test {
     _ = @import("test/wake.zig");
     _ = @import("test/cancel.zig");
     _ = @import("test/poll_first.zig");
+    _ = @import("test/recv_multi.zig");
     _ = @import("test/reuse.zig");
     _ = @import("test/group.zig");
     _ = @import("test/blocking_sockets.zig");

@@ -289,6 +289,30 @@ pub fn Backend(comptime mode: Mode) type {
             _ = self;
         }
 
+        pub fn hasRecvBuffers(self: *const Self) bool {
+            return switch (mode) {
+                .io_uring => self.engine.io_uring.hasRecvBuffers(),
+                .epoll => false,
+                .auto => switch (self.engine) {
+                    .io_uring => |*engine| engine.hasRecvBuffers(),
+                    .epoll => false,
+                },
+            };
+        }
+
+        /// See IoUring.initRecvBuffers. error.Unsupported on epoll, which has
+        /// no multishot receive.
+        pub fn initRecvBuffers(self: *Self, gpa: std.mem.Allocator, count: u16, size: u32) !void {
+            return switch (mode) {
+                .io_uring => self.engine.io_uring.initRecvBuffers(gpa, count, size),
+                .epoll => error.Unsupported,
+                .auto => switch (self.engine) {
+                    .io_uring => |*engine| engine.initRecvBuffers(gpa, count, size),
+                    .epoll => error.Unsupported,
+                },
+            };
+        }
+
         pub fn hasPendingChanges(self: *const Self) bool {
             return switch (mode) {
                 .io_uring => self.engine.io_uring.hasPendingChanges(),

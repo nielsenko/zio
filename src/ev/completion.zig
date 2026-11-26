@@ -72,6 +72,7 @@ pub const Op = enum {
     net_connect,
     net_accept,
     net_recv,
+    net_recv_multi,
     net_send,
     net_recvfrom,
     net_sendto,
@@ -139,6 +140,7 @@ pub const Op = enum {
             .net_connect => NetConnect,
             .net_accept => NetAccept,
             .net_recv => NetRecv,
+            .net_recv_multi => NetRecvMulti,
             .net_send => NetSend,
             .net_recvfrom => NetRecvFrom,
             .net_sendto => NetSendTo,
@@ -208,6 +210,7 @@ pub const Op = enum {
             NetConnect => .net_connect,
             NetAccept => .net_accept,
             NetRecv => .net_recv,
+            NetRecvMulti => .net_recv_multi,
             NetSend => .net_send,
             NetRecvFrom => .net_recvfrom,
             NetSendTo => .net_sendto,
@@ -990,6 +993,51 @@ pub const NetRecv = struct {
 
     pub fn getResult(self: *const NetRecv) Error!usize {
         return self.c.getResult(.net_recv);
+    }
+};
+
+/// Receives what arrives on a stream socket chunk by chunk, until the peer
+/// ends the stream, an error, or a cancel. `on_data` runs on the loop's
+/// thread for each chunk, with bytes that stay valid only for the call, and
+/// may add and cancel completions. The completion finishes once, after the
+/// last chunk: without an error at the end of the stream, and otherwise with
+/// the error, error.Canceled for a cancel. Chunks the kernel took before a
+/// cancel still reach `on_data` first.
+///
+/// On io_uring with `Loop.Options.recv_buffers`, this is one multishot
+/// receive into the loop's buffers, so the socket is armed once for every
+/// chunk. Elsewhere the loop receives into `buffer`, one receive at a time.
+pub const NetRecvMulti = struct {
+    c: Completion,
+    result_private_do_not_touch: void = {},
+    route: RouteData(.net_recv_multi) = .none,
+    fallback: if (Backend.capability(.net_recv_multi) != .yes) Fallback else struct {} = .{},
+    handle: Backend.NetHandle,
+    /// Where the loop receives when it does so one receive at a time, and so
+    /// the largest chunk there.
+    buffer: []u8,
+    on_data: *const fn (*NetRecvMulti, []const u8) void,
+
+    pub const Fallback = struct {
+        recv: NetRecv = undefined,
+        iov: [1]os.iovec = undefined,
+        /// The receive is in flight.
+        busy: bool = false,
+    };
+
+    pub const Error = net.RecvError || Cancelable;
+
+    pub fn init(handle: Backend.NetHandle, buffer: []u8, on_data: *const fn (*NetRecvMulti, []const u8) void) NetRecvMulti {
+        return .{
+            .c = .init(.net_recv_multi),
+            .handle = handle,
+            .buffer = buffer,
+            .on_data = on_data,
+        };
+    }
+
+    pub fn getResult(self: *const NetRecvMulti) Error!void {
+        return self.c.getResult(.net_recv_multi);
     }
 };
 

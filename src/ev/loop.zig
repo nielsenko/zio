@@ -16,6 +16,8 @@ const Heap = @import("heap.zig").Heap;
 const Work = @import("completion.zig").Work;
 const DelegatedWork = @import("completion.zig").DelegatedWork;
 const FileRead = @import("completion.zig").FileRead;
+const NetRecv = @import("completion.zig").NetRecv;
+const NetRecvMulti = @import("completion.zig").NetRecvMulti;
 const NetSend = @import("completion.zig").NetSend;
 const NetSendFile = @import("completion.zig").NetSendFile;
 const ReadBuf = @import("buf.zig").ReadBuf;
@@ -563,6 +565,16 @@ pub const Loop = struct {
         loop_group: ?*LoopGroup = null,
         queue_size: u16 = default_queue_size,
         do_not_call_callbacks: bool = false,
+        /// Buffers for NetRecvMulti on a backend that receives into buffers
+        /// of its own, io_uring: `count` of `size` bytes, `count` a power of
+        /// two. With none, NetRecvMulti receives one receive at a time there
+        /// too.
+        recv_buffers: RecvBuffers = .{},
+
+        pub const RecvBuffers = struct {
+            count: u16 = 0,
+            size: u32 = 4096,
+        };
     };
 
     pub fn init(self: *Loop, options: Options) !void {
@@ -605,6 +617,13 @@ pub const Loop = struct {
             &self.loop_group.shared,
         );
         errdefer self.backend.deinit();
+        if (comptime @hasDecl(Backend, "initRecvBuffers")) {
+            // A kernel without provided buffer rings leaves NetRecvMulti to
+            // the fallback.
+            if (options.recv_buffers.count != 0) {
+                self.backend.initRecvBuffers(options.allocator, options.recv_buffers.count, options.recv_buffers.size) catch {};
+            }
+        }
 
         self.state.initialized = true;
 
@@ -625,6 +644,13 @@ pub const Loop = struct {
         self.backend.deinit();
         if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
         _ = self.loop_group.loops.fetchSub(1, .monotonic);
+    }
+
+    /// Whether a NetRecvMulti here is one multishot receive into the loop's
+    /// buffers, rather than one receive at a time into its own.
+    pub fn hasRecvBuffers(self: *const Loop) bool {
+        if (comptime !@hasDecl(Backend, "hasRecvBuffers")) return false;
+        return self.backend.hasRecvBuffers();
     }
 
     /// Whether the next poll has work that needs no wait.
@@ -968,6 +994,18 @@ pub const Loop = struct {
                     },
                 }
             },
+            .net_recv_multi => {
+                const op = completion.cast(NetRecvMulti);
+                switch (comptime Backend.capability(.net_recv_multi)) {
+                    .yes => self.backend.cancel(&self.state, completion),
+                    .no => self.netRecvMultiCancel(op),
+                    .maybe => switch (op.route) {
+                        .none => unreachable,
+                        .backend => self.backend.cancel(&self.state, completion),
+                        .fallback => self.netRecvMultiCancel(op),
+                    },
+                }
+            },
 
             inline else => |op| {
                 const op_data = completion.cast(op.toType());
@@ -1118,6 +1156,23 @@ pub const Loop = struct {
                         } else {
                             op.route = .fallback;
                             netSendFileStart(self, op);
+                        }
+                    },
+                }
+                return;
+            },
+            .net_recv_multi => {
+                const op = completion.cast(NetRecvMulti);
+                switch (comptime Backend.capability(.net_recv_multi)) {
+                    .yes => self.backend.submit(&self.state, .net_recv_multi, completion),
+                    .no => self.netRecvMultiNext(op),
+                    .maybe => {
+                        if (self.backend.supports(.net_recv_multi, op)) {
+                            op.route = .backend;
+                            self.backend.submit(&self.state, .net_recv_multi, completion);
+                        } else {
+                            op.route = .fallback;
+                            self.netRecvMultiNext(op);
                         }
                     },
                 }
@@ -1482,6 +1537,36 @@ pub const Loop = struct {
     //
     // Order is preserved by `next_read`/`next_send`, which both alternate 0,1,0,1
     // from the same start, so buffers are sent in the order they were read.
+
+    /// The NetRecvMulti fallback: one NetRecv into `op.buffer` after another,
+    /// until the end of the stream, an error or a cancel.
+    fn netRecvMultiNext(self: *Loop, op: *NetRecvMulti) void {
+        const f = &op.fallback;
+        f.recv = NetRecv.init(op.handle, ReadBuf.fromSlice(op.buffer, &f.iov), .{});
+        f.recv.c.userdata = op;
+        f.recv.c.callback = netRecvMultiOnRecv;
+        f.busy = true;
+        self.addInternal(&f.recv.c);
+    }
+
+    fn netRecvMultiCancel(self: *Loop, op: *NetRecvMulti) void {
+        if (op.fallback.busy) self.cancel(&op.fallback.recv.c);
+    }
+
+    fn netRecvMultiOnRecv(loop: *Loop, child: *Completion) void {
+        const op: *NetRecvMulti = @ptrCast(@alignCast(child.userdata.?));
+        op.fallback.busy = false;
+        const n = child.cast(NetRecv).getResult() catch |err| return loop.netRecvMultiFinish(op, err);
+        if (n == 0) return loop.netRecvMultiFinish(op, null);
+        op.on_data(op, op.buffer[0..n]);
+        if (op.c.loadState().cancel_requested) return loop.netRecvMultiFinish(op, error.Canceled);
+        loop.netRecvMultiNext(op);
+    }
+
+    fn netRecvMultiFinish(self: *Loop, op: *NetRecvMulti, err: ?anyerror) void {
+        if (err) |e| op.c.setError(e) else op.c.setResult(.net_recv_multi, {});
+        self.state.markCompleted(&op.c);
+    }
 
     fn netSendFileStart(self: *Loop, op: *NetSendFile) void {
         if (op.bufs[0].len == 0 and op.bufs[1].len == 0) {
