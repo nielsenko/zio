@@ -1121,6 +1121,11 @@ pub const RecvFlags = packed struct {
     /// `supports_recv_dontwait` complete such an operation immediately instead
     /// of parking it on readiness.
     dontwait: bool = false,
+    /// A hint that nothing is queued yet, as for a receive posted right after
+    /// a response went out. io_uring then waits for readiness before it tries
+    /// the socket (IORING_RECVSEND_POLL_FIRST), and skips a receive bound to
+    /// fail. The other backends ignore it.
+    poll_first: bool = false,
 };
 
 fn recvFlagsToSys(flags: RecvFlags) c_int {

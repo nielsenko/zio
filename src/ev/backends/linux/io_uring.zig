@@ -792,6 +792,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
             if (data.buffers.iovecs.len == 1) {
                 const iov = data.buffers.iovecs[0];
                 sqe.prep_recv(data.handle, iov.base[0..iov.len], recvFlagsToMsg(data.flags));
+                sqe.ioprio |= recvPollFirst(data.flags);
             } else {
                 data.internal.msg = .{
                     .name = null,
@@ -803,6 +804,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                     .flags = 0,
                 };
                 sqe.prep_recvmsg(data.handle, &data.internal.msg, recvFlagsToMsg(data.flags));
+                sqe.ioprio |= recvPollFirst(data.flags);
             }
             sqe.user_data = @intFromPtr(c);
         },
@@ -870,6 +872,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
             const sqe = self.getSqeOrDefer(c) orelse return;
             const cloexec_flag: u32 = if (data.control != null) linux.MSG.CMSG_CLOEXEC else 0;
             sqe.prep_recvmsg(data.handle, &data.internal.msg, recvFlagsToMsg(data.flags) | cloexec_flag);
+            sqe.ioprio |= recvPollFirst(data.flags);
             sqe.user_data = @intFromPtr(c);
         },
         .net_recvmmsg => {
@@ -2177,6 +2180,11 @@ fn recvFlagsToMsg(flags: net.RecvFlags) u32 {
     // attempt is posted as the CQE instead of arming poll.
     if (flags.dontwait) msg_flags |= linux.MSG.DONTWAIT;
     return msg_flags;
+}
+
+/// The SQE `ioprio` bits for `flags.poll_first`.
+fn recvPollFirst(flags: net.RecvFlags) u16 {
+    return if (flags.poll_first) linux.IORING_RECVSEND_POLL_FIRST else 0;
 }
 
 fn sendFlagsToMsg(flags: net.SendFlags) u32 {
