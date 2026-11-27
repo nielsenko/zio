@@ -109,6 +109,9 @@ pub const Table = struct {
     refcount: usize = 0,
     allocator: std.mem.Allocator = undefined,
     shards: [shard_count]Shard = @splat(.{}),
+    /// The table of a loop's own group, which no other loop joins: only the
+    /// thread driving that loop reads or writes it, so shards take no lock.
+    exclusive: bool = false,
 
     pub fn acquire(self: *Table, allocator: std.mem.Allocator) void {
         self.mutex.lock();
@@ -132,6 +135,14 @@ pub const Table = struct {
     pub fn shardForFd(self: *Table, fd: i32) *Shard {
         const key: u32 = @bitCast(fd);
         return &self.shards[key & (shard_count - 1)];
+    }
+
+    pub fn lock(self: *Table, shard: *Shard) void {
+        if (!self.exclusive) shard.mutex.lock();
+    }
+
+    pub fn unlock(self: *Table, shard: *Shard) void {
+        if (!self.exclusive) shard.mutex.unlock();
     }
 };
 
@@ -221,9 +232,9 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
     const table = &self.shared.sock_table;
     const shard = table.shardForFd(fd);
 
-    shard.mutex.lock();
+    table.lock(shard);
     const gop = shard.map.getOrPut(table.allocator, @as(u32, @bitCast(fd))) catch {
-        shard.mutex.unlock();
+        table.unlock(shard);
         log.err("sock registration table OOM", .{});
         completion.setError(error.Unexpected);
         state.markCompletedFromBackend(completion);
@@ -239,7 +250,7 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
     if (ready.*) {
         ready.* = false;
         if (created and entry.isEmpty()) _ = shard.map.remove(@as(u32, @bitCast(fd)));
-        shard.mutex.unlock();
+        table.unlock(shard);
         return .retry;
     }
 
@@ -248,7 +259,7 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
         const other_owned_here = entry.ownerPtr(other(dir)).* == self_opaque;
         if (!self.registerSocket(fd, dir, other_owned_here)) {
             if (created and entry.isEmpty()) _ = shard.map.remove(@as(u32, @bitCast(fd)));
-            shard.mutex.unlock();
+            table.unlock(shard);
             completion.setError(error.Unexpected);
             state.markCompletedFromBackend(completion);
             return .failed;
@@ -266,7 +277,7 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
     completion.prev = null;
     completion.next = null;
     entry.waiters(dir).push(completion);
-    shard.mutex.unlock();
+    table.unlock(shard);
     return .parked;
 }
 
@@ -275,10 +286,11 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
 /// completes them after unlocking (completing can resume a fiber re-entrantly).
 pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: anytype) void {
     const Backend = @TypeOf(self.*);
-    const shard = self.shared.sock_table.shardForFd(fd);
-    shard.mutex.lock();
+    const table = &self.shared.sock_table;
+    const shard = table.shardForFd(fd);
+    table.lock(shard);
     const entry = shard.map.getPtr(@as(u32, @bitCast(fd))) orelse {
-        shard.mutex.unlock();
+        table.unlock(shard);
         return;
     };
 
@@ -307,7 +319,7 @@ pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: any
             },
         }
     }
-    shard.mutex.unlock();
+    table.unlock(shard);
 
     while (to_finish.pop()) |c| {
         state.markCompletedFromBackend(c);
@@ -334,9 +346,10 @@ pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: any
 pub fn detach(self: anytype, target: *Completion) bool {
     const fd = netHandle(target);
     const dir = dirForOp(target);
-    const shard = self.shared.sock_table.shardForFd(fd);
-    shard.mutex.lock();
-    defer shard.mutex.unlock();
+    const table = &self.shared.sock_table;
+    const shard = table.shardForFd(fd);
+    table.lock(shard);
+    defer table.unlock(shard);
     if (target.has_result) return false;
     // A live parked op always has an entry: detach only runs while the op is not
     // yet completed (loop.cancel and cancelLocal both bail on the `.completed`
@@ -368,8 +381,8 @@ pub fn leave(
     const leaving: *anyopaque = @ptrCast(loop);
     var stranded: usize = 0;
     for (&table.shards) |*shard| {
-        shard.mutex.lock();
-        defer shard.mutex.unlock();
+        table.lock(shard);
+        defer table.unlock(shard);
         var it = shard.map.iterator();
         while (it.next()) |kv| {
             const fd: net.fd_t = @bitCast(kv.key_ptr.*);
@@ -401,8 +414,9 @@ pub fn leave(
 /// the fd removes it from every poller at the kernel level, so this only drops
 /// the software bookkeeping (for all loops at once) plus this loop's poller entry.
 pub fn unregister(self: anytype, fd: net.fd_t) void {
-    const shard = self.shared.sock_table.shardForFd(fd);
-    shard.mutex.lock();
+    const table = &self.shared.sock_table;
+    const shard = table.shardForFd(fd);
+    table.lock(shard);
     if (shard.map.getPtr(@as(u32, @bitCast(fd)))) |entry| {
         // Closing an fd with ops still parked on it would orphan those
         // completions (removed here without finishing) and leak their
@@ -413,7 +427,7 @@ pub fn unregister(self: anytype, fd: net.fd_t) void {
         std.debug.assert(entry.waiters(.write).head == null);
     }
     _ = shard.map.remove(@as(u32, @bitCast(fd)));
-    shard.mutex.unlock();
+    table.unlock(shard);
     self.unregisterCleanup(fd);
 }
 

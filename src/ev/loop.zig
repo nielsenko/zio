@@ -609,6 +609,8 @@ pub const Loop = struct {
         errdefer _ = self.loop_group.loops.fetchSub(1, .monotonic);
 
         if (has_sock_table) Backend.sockTable(&self.loop_group.shared).acquire(self.loop_group.allocator);
+        // A loop of its own group is the only one to use the table.
+        if (has_sock_table and self.loop_group == &self.internal_loop_group) Backend.sockTable(&self.loop_group.shared).exclusive = true;
         errdefer if (has_sock_table) Backend.sockTable(&self.loop_group.shared).release();
 
         try self.backend.init(
