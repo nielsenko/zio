@@ -1122,9 +1122,16 @@ pub const RecvFlags = packed struct {
     /// of parking it on readiness.
     dontwait: bool = false,
     /// A hint that nothing is queued yet, as for a receive posted right after
-    /// a response went out. io_uring then waits for readiness before it tries
-    /// the socket (IORING_RECVSEND_POLL_FIRST), and skips a receive bound to
-    /// fail. The other backends ignore it.
+    /// a response went out. The receive then waits for readiness before it
+    /// tries the socket, and skips a receive bound to fail. io_uring does so
+    /// in the kernel (IORING_RECVSEND_POLL_FIRST), which checks readiness as
+    /// it arms. epoll and kqueue park the receive without trying, which their
+    /// edge-triggered interest allows only when the caller's last read on the
+    /// socket came back short: bytes still queued from before that read raise
+    /// no new edge, and the receive would wait for the peer's next write. A
+    /// loop whose tries of such receives mostly find bytes, as a saturated
+    /// server's do, tries first instead. The other backends ignore it, as do
+    /// receives with `dontwait`.
     poll_first: bool = false,
 };
 

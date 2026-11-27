@@ -420,25 +420,76 @@ pub fn unregister(self: anytype, fd: net.fd_t) void {
 /// Generic submit for socket read/write/accept-family ops: try the syscall
 /// optimistically (reusing checkCompletion with a no-error event) and only park
 /// on WouldBlock. Draining to EAGAIN first is what makes edge-triggered safe.
+/// A receive with `RecvFlags.poll_first` parks first: its caller's last read
+/// drained the socket, and an edge since then makes the park retry. Unless
+/// the loop's tries of such receives mostly find bytes, see `poll_first_try`.
 pub fn submitIo(self: anytype, state: anytype, c: *Completion) void {
     const Backend = @TypeOf(self.*);
     const fd = netHandle(c);
     const dir = dirForOp(c);
+    const poll_first = pollFirst(c);
+    if (poll_first and !state.poll_first_try) {
+        state.poll_first_parked += 1;
+        if (state.poll_first_parked < poll_first_sample) switch (park(self, state, fd, c)) {
+            .parked, .failed => return,
+            .retry => {},
+        };
+        state.poll_first_parked = 0;
+    }
     var probe = Backend.probeEvent(fd, dir);
+    var first = poll_first;
     while (true) {
         switch (Backend.checkCompletion(c, &probe)) {
             .completed => {
+                if (first) pollFirstTried(state, true);
                 // Inline finish (flags permitting) lets a bulk sender batch
                 // until WouldBlock instead of paying a poll per chunk (#525).
                 state.markCompletedFromBackend(c);
                 return;
             },
-            .requeue => switch (park(self, state, fd, c)) {
-                .parked, .failed => return,
-                .retry => {}, // loop and retry the syscall
+            .requeue => {
+                if (first) pollFirstTried(state, false);
+                first = false;
+                switch (park(self, state, fd, c)) {
+                    .parked, .failed => return,
+                    .retry => {}, // loop and retry the syscall
+                }
             },
         }
     }
+}
+
+/// While poll_first receives park first, one in this many tries the socket,
+/// so the loop sees when they would find bytes.
+pub const poll_first_sample = 16;
+/// The tries a loop counts before it picks the way of poll_first receives.
+pub const poll_first_window = 64;
+
+/// Counts a try of a poll_first receive. At the end of a window the loop's
+/// receives try first if three in four tries found bytes, and park first if
+/// one in four or fewer did.
+fn pollFirstTried(state: anytype, hit: bool) void {
+    state.poll_first_tries += 1;
+    if (hit) state.poll_first_hits += 1;
+    if (state.poll_first_tries < poll_first_window) return;
+    if (state.poll_first_hits * 4 >= poll_first_window * 3) {
+        state.poll_first_try = true;
+    } else if (state.poll_first_hits * 4 <= poll_first_window) {
+        state.poll_first_try = false;
+    }
+    state.poll_first_tries = 0;
+    state.poll_first_hits = 0;
+}
+
+/// Whether `c` is a receive that waits for readiness before its first
+/// attempt, see `RecvFlags.poll_first`.
+fn pollFirst(c: *Completion) bool {
+    const flags = switch (c.op) {
+        .net_recv => c.cast(NetRecv).flags,
+        .net_recvmsg => c.cast(NetRecvMsg).flags,
+        else => return false,
+    };
+    return flags.poll_first and !flags.dontwait;
 }
 
 /// Generic connect submit: try connect() first, register on WouldBlock.

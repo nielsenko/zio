@@ -237,6 +237,17 @@ pub const LoopState = struct {
     /// drained from `work_completions`. Owner thread only.
     pool_inflight: usize = 0,
 
+    /// Receives with `RecvFlags.poll_first` try the socket first: most of
+    /// the last window's tries found bytes already. Otherwise they park
+    /// first. See `sockreg.submitIo`.
+    poll_first_try: bool = false,
+    /// Tries of poll_first receives in the current window, and the ones that
+    /// found bytes.
+    poll_first_tries: u16 = 0,
+    poll_first_hits: u16 = 0,
+    /// poll_first receives that parked first since the last try.
+    poll_first_parked: u16 = 0,
+
     /// Wake requests (`wake_loop`, `wake_async`, `wake_cancel`) plus the
     /// `sleeping` bit the loop sets before a blocking backend poll. Cleared
     /// as a whole after every poll. See `requestWake`.
