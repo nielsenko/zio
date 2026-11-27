@@ -850,8 +850,14 @@ fn handleEpollError(event: *const std.os.linux.epoll_event, comptime errnoToErro
     const has_error = (event.events & std.os.linux.EPOLL.ERR) != 0;
     const has_hup = (event.events & std.os.linux.EPOLL.HUP) != 0;
     if (!has_error and !has_hup) return null;
+    return socketError(eventFd(event), errnoToError);
+}
 
-    const sock_err = net.getSockError(eventFd(event)) catch return error.Unexpected;
+/// The socket's pending error once epoll reported ERR or HUP. Out of line,
+/// or every arm of checkCompletion carries a getsockopt of its own.
+noinline fn socketError(fd: net.fd_t, comptime errnoToError: fn (net.E) anyerror) ?anyerror {
+    @branchHint(.cold);
+    const sock_err = net.getSockError(fd) catch return error.Unexpected;
     if (sock_err == 0) return null; // No actual error, caller should retry operation
     return errnoToError(@fromBackingInt(@intCast(sock_err)));
 }

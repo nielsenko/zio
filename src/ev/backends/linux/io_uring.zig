@@ -359,7 +359,9 @@ const AcceptHints = struct {
         return self.find(fd) != null;
     }
 
-    fn insert(self: *AcceptHints, fd: net.fd_t) void {
+    // Out of line, as the CQE loop calls both: the probes unroll over
+    // the whole table.
+    noinline fn insert(self: *AcceptHints, fd: net.fd_t) void {
         if (fd < 0) return;
         for (0..2) |_| {
             var i = home(fd);
@@ -375,7 +377,7 @@ const AcceptHints = struct {
         }
     }
 
-    fn remove(self: *AcceptHints, fd: net.fd_t) void {
+    noinline fn remove(self: *AcceptHints, fd: net.fd_t) void {
         var hole = self.find(fd) orelse return;
         var j = hole;
         while (true) {
@@ -1381,7 +1383,7 @@ fn netSendFileIssue(self: *Self, c: *Completion) void {
 /// Advance the sendfile chain on a CQE for its in-flight SQE. Issues the next
 /// step, or tears down and completes the op (via the storeResult arm) when the
 /// transfer is done, failed, or canceled.
-fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) void {
+noinline fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) void {
     const data = c.cast(NetSendFile);
 
     // Bytes a splice delivered to the socket count toward the result even
@@ -2207,7 +2209,7 @@ fn statxTimeToNanos(ts: linux.statx_timestamp) i64 {
     return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
-fn storeRecvMmsgResult(c: *Completion, res: i32, _: u32) void {
+noinline fn storeRecvMmsgResult(c: *Completion, res: i32, _: u32) void {
     const data = c.cast(NetRecvMmsg);
     if (res < 0) {
         c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
@@ -2244,7 +2246,7 @@ fn storeRecvMmsgResult(c: *Completion, res: i32, _: u32) void {
 /// sent, so it is dropped the way sendmmsg drops one: the short count makes the
 /// caller re-submit the rest, and that reports it. A canceled op sends nothing
 /// more.
-fn storeSendMmsgResult(c: *Completion, res: i32) void {
+noinline fn storeSendMmsgResult(c: *Completion, res: i32) void {
     const data = c.cast(NetSendMmsg);
     if (res < 0) {
         c.setError(net.errnoToSendError(@fromBackingInt(@intCast(-res))));
